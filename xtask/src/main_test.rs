@@ -106,6 +106,114 @@ fn every_linux_package_uses_the_canonical_desktop_asset_installer() {
 }
 
 #[test]
+fn release_workflow_packages_tarballs_with_canonical_release_script() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    for job_name in [
+        "build-linux-x86_64",
+        "build-linux-aarch64",
+        "build-macos-aarch64",
+    ] {
+        let job = github_workflow_job(workflow, job_name);
+        assert!(
+            job.contains("./scripts/package-release.sh"),
+            "{job_name} bypasses canonical release packaging"
+        );
+    }
+}
+
+#[test]
+fn release_workflow_uses_workspace_versioned_manual_releases() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    let prepare = github_workflow_job(workflow, "prepare-release");
+
+    assert!(prepare.contains("cargo metadata --no-deps --format-version 1"));
+    assert!(prepare.contains("select(.name == \"neomacs\") | .version"));
+    assert!(prepare.contains("version=\"${base_version}.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:7}\""));
+    assert!(prepare.contains("tag=\"v$version\""));
+    assert!(prepare.contains("version=$version"));
+    assert!(prepare.contains("tag=$tag"));
+    assert!(prepare.contains("prerelease=$prerelease"));
+    assert!(prepare.contains("make_latest=$make_latest"));
+    assert!(prepare.contains("git push origin \"refs/tags/$tag\""));
+    assert!(prepare.contains("prerelease: ${{ steps.metadata.outputs.prerelease }}"));
+    assert!(prepare.contains("make_latest: ${{ steps.metadata.outputs.make_latest }}"));
+    assert!(!prepare.contains("target_commitish"));
+    assert!(!prepare.contains("discussion_category_name"));
+    assert!(!prepare.contains("0.0.0"));
+    assert!(!prepare.contains("prerelease=true"));
+    assert!(!prepare.contains("make_latest=false"));
+}
+
+#[test]
+fn release_workflow_verifies_synthetic_tag_before_reusing_it() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    let prepare = github_workflow_job(workflow, "prepare-release");
+
+    assert!(
+        prepare.contains("git rev-parse --verify \"${tag}^{commit}\""),
+        "unverified rev-parse echoes a missing tag and makes it look like a conflicting tag"
+    );
+}
+
+#[test]
+fn release_workflow_uploads_each_platform_without_a_build_barrier() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    assert!(!workflow.contains("create-release:"));
+    assert!(!workflow.contains("actions/upload-artifact@"));
+    assert!(!workflow.contains("actions/download-artifact@"));
+
+    for job_name in [
+        "build-linux-x86_64",
+        "build-linux-aarch64",
+        "build-macos-aarch64",
+        "build-windows-x86_64",
+    ] {
+        let job = github_workflow_job(workflow, job_name);
+        assert!(job.contains("needs: prepare-release"));
+        assert!(job.contains("softprops/action-gh-release@"));
+        assert!(job.contains("tag_name: ${{ needs.prepare-release.outputs.tag }}"));
+    }
+}
+
+#[test]
+fn release_workflow_caches_workspace_crates_per_flavor() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    for (job_name, cache_key) in [
+        ("build-linux-x86_64", "release-linux-x86_64"),
+        ("build-linux-aarch64", "release-linux-aarch64"),
+        ("build-macos-aarch64", "release-macos-aarch64"),
+        ("build-windows-x86_64", "release-windows-msvc-x86_64"),
+    ] {
+        let job = github_workflow_job(workflow, job_name);
+        assert!(job.contains(&format!("cache-key: {cache_key}")));
+        assert!(
+            job.contains("cache-workspace-crates: true"),
+            "{job_name} does not cache its workspace crates"
+        );
+    }
+}
+
+#[test]
+fn release_build_jobs_are_limited_to_under_one_hour() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    for job_name in [
+        "build-linux-x86_64",
+        "build-linux-aarch64",
+        "build-macos-aarch64",
+        "build-windows-x86_64",
+    ] {
+        let job = github_workflow_job(workflow, job_name);
+        assert!(
+            job.contains("timeout-minutes: 59"),
+            "{job_name} is not limited to under one hour"
+        );
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -346,6 +454,8 @@ fn rust_ci_setup_uses_the_workspace_toolchain_and_owns_test_tooling() {
     let action = include_str!("../../.github/actions/setup-rust/action.yml");
 
     assert!(action.contains("cache-key:"));
+    assert!(action.contains("cache-workspace-crates:"));
+    assert!(action.contains("cache-workspace-crates: ${{ inputs.cache-workspace-crates }}"));
     assert!(action.contains("hashFiles('scripts/ci/setup-linux.sh'"));
     assert!(action.contains("install-nextest:"));
     assert!(action.contains("actions-rust-lang/setup-rust-toolchain@"));
@@ -757,6 +867,30 @@ fn parse_release_uses_release_bin_dir() {
     let options = parse_options(&["--release"]);
     assert_eq!(options.profile, BuildProfile::Release);
     assert_eq!(options.bin_dir, PathBuf::from("/repo/target/release"));
+}
+
+#[test]
+fn parse_dev_skips_byte_compile_by_default() {
+    let options = parse_options(&["--profile", "dev"]);
+    assert_eq!(options.profile, BuildProfile::Dev);
+    assert_eq!(options.bin_dir, PathBuf::from("/repo/target/debug"));
+    assert!(options.no_byte_compile);
+}
+
+#[test]
+fn parse_dev_release_skips_byte_compile_by_default() {
+    let options = parse_options(&["--profile", "dev-release"]);
+    assert_eq!(options.profile, BuildProfile::DevRelease);
+    assert_eq!(options.bin_dir, PathBuf::from("/repo/target/dev-release"));
+    assert!(options.no_byte_compile);
+}
+
+#[test]
+fn parse_dev_preserves_no_byte_compile_flag() {
+    let options = parse_options(&["--profile", "dev", "--no-byte-compile"]);
+    assert_eq!(options.profile, BuildProfile::Dev);
+    assert_eq!(options.bin_dir, PathBuf::from("/repo/target/debug"));
+    assert!(options.no_byte_compile);
 }
 
 #[test]
@@ -1554,6 +1688,17 @@ fn validate_primary_loaddefs_rejects_crlf_output_as_a_gnu_mismatch() {
         err.to_string().contains("missing GNU end boundary"),
         "CRLF output must remain a surfaced GNU mismatch: {err}"
     );
+}
+
+#[test]
+fn normalize_lisp_line_endings_rewrites_crlf() {
+    let tempdir = tempdir();
+    let path = tempdir.join("loaddefs.el");
+    fs::write(&path, b"first\r\nsecond\r\n").unwrap();
+
+    normalize_lisp_line_endings(&path).unwrap();
+
+    assert_eq!(fs::read(&path).unwrap(), b"first\nsecond\n");
 }
 
 #[test]
