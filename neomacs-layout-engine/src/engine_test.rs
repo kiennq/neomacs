@@ -4863,6 +4863,26 @@ fn layout_frame_rust_display_table_maps_char_to_glyph_vector() {
 }
 
 #[test]
+fn layout_frame_rust_display_table_replaces_newline_without_row_break() {
+    let text = "a\nb\n";
+    let setup = |buffer: &mut neovm_core::buffer::Buffer, _id: BufferId, _t: &str| {
+        let table = Value::make_char_table(Value::symbol("display-table"), Value::NIL, 6);
+        neovm_core::emacs_core::chartable::ct_set_single(
+            &table,
+            '\n' as i64,
+            Value::vector(vec![Value::fixnum('$' as i64)]),
+        );
+        buffer.set_buffer_local("buffer-display-table", table);
+    };
+    let trace = layout_trace_with_buffer_setup(text, 360, 180, setup);
+
+    assert!(
+        backend_trace_text_area_text(&trace).contains("a$b$"),
+        "a newline display-table entry without a trailing newline joins rows"
+    );
+}
+
+#[test]
 fn layout_frame_rust_display_table_maps_tab_to_glyph_then_tab() {
     // whitespace-mode pattern: `buffer-display-table` maps TAB to `[?> ?\t]` so
     // a leading indentation tab shows a `>` marker followed by tab spacing.  The

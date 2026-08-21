@@ -124,7 +124,6 @@ impl<'a> BufferSourceItemRenderRequest<'a> {
         buffer: &B,
         state: BufferSourceLoopMutableState<'_, '_, '_>,
     ) -> BufferSourceItemRenderOutcome {
-        debug_assert_ne!(source_item.source_step_char().ch(), '\n');
         self.render_prepared_source_item_and_apply(source_item, source_walk, buffer, state)
     }
 
