@@ -473,13 +473,14 @@ fn ci_pins_external_actions_and_enables_automated_updates() {
     let workflows = [
         include_str!("../../.github/workflows/nextest-shards.yml"),
         include_str!("../../.github/workflows/ci.yml"),
-        include_str!("../../.github/workflows/codeql.yml"),
-        include_str!("../../.github/workflows/linux.yml"),
-        include_str!("../../.github/workflows/nix-smoke.yml"),
+        include_str!("../../.github/workflows/codeql.yml.disable"),
+        include_str!("../../.github/workflows/linux.yml.disable"),
+        include_str!("../../.github/workflows/nix-smoke.yml.disable"),
         include_str!("../../.github/workflows/release.yml"),
-        include_str!("../../.github/workflows/tmp_mac_test.yml"),
-        include_str!("../../.github/workflows/window-oracle-nightly.yml"),
-        include_str!("../../.github/workflows/windows-installer.yml"),
+        include_str!("../../.github/workflows/sync.yml"),
+        include_str!("../../.github/workflows/tmp_mac_test.yml.disable"),
+        include_str!("../../.github/workflows/window-oracle-nightly.yml.disable"),
+        include_str!("../../.github/workflows/windows-installer.yml.disable"),
         include_str!("../../.github/actions/setup-rust/action.yml"),
     ];
 
@@ -513,6 +514,21 @@ fn ci_pins_external_actions_and_enables_automated_updates() {
     let dependabot = include_str!("../../.github/dependabot.yml");
     assert!(dependabot.contains("package-ecosystem: github-actions"));
     assert!(dependabot.contains("directory: /"));
+}
+
+#[test]
+fn sync_workflow_rebases_fork_main_every_twelve_hours() {
+    let workflow = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/sync.yml"),
+    )
+    .expect("sync workflow");
+
+    assert!(workflow.contains("cron: \"0 */12 * * *\""));
+    assert!(workflow.contains("upstream_repo: eval-exec/neomacs"));
+    assert!(workflow.contains("upstream_branch: main"));
+    assert!(workflow.contains("origin_branch: main"));
+    assert!(workflow.contains("git rebase --autosquash --autostash upstream/$upstream_branch"));
+    assert!(workflow.contains("git push origin -f HEAD:$origin_branch"));
 }
 
 #[test]
