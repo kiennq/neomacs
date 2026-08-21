@@ -5,6 +5,8 @@ use crate::heap_types::LispString;
 use crate::test_utils::{runtime_startup_eval_all, runtime_startup_eval_one};
 use std::cell::RefCell;
 use std::rc::Rc;
+#[cfg(windows)]
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -1804,6 +1806,574 @@ fn make_process_accepts_existing_pipe_process_for_stderr() {
 }
 
 #[test]
+fn make_process_merges_stderr_when_deleted_stderr_pipe_is_stale() {
+    crate::test_utils::init_test_tracing();
+    let mut buffers = crate::buffer::BufferManager::new();
+    let mut pm = ProcessManager::new();
+    let threads = crate::emacs_core::threads::ThreadManager::new();
+    let stderrproc = builtin_make_pipe_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("deleted-stderr"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+    )
+    .expect("make-pipe-process");
+    let stderr_id = stderrproc.as_process_id().expect("stderr pipe process id");
+    assert!(pm.delete_process(stderr_id));
+
+    let process = builtin_make_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        vec![
+            Value::keyword(":name"),
+            Value::string("stale-stderr-owner"),
+            Value::keyword(":command"),
+            Value::list(vec![
+                Value::string(find_bin("sh")),
+                Value::string("-c"),
+                Value::string("printf MERGED >&2"),
+            ]),
+            Value::keyword(":stderr"),
+            stderrproc,
+            Value::keyword(":connection-type"),
+            Value::symbol("pipe"),
+        ],
+        false,
+    )
+    .expect("stale :stderr should merge stderr into stdout");
+    let owner_id = process.as_process_id().expect("owner process id");
+    let coding_systems = crate::emacs_core::coding::CodingSystemManager::new();
+    let mut output = Vec::new();
+    for _ in 0..100 {
+        if let Some(read) = pm.read_process_output_without_decoding(
+            owner_id,
+            ProcessOutputDestination::to_filter(),
+            &coding_systems,
+        ) {
+            output.extend_from_slice(read.undecoded_bytes());
+            if output == b"MERGED" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(output, b"MERGED");
+}
+
+#[test]
+fn make_process_merges_stderr_when_pipe_writer_was_already_consumed() {
+    crate::test_utils::init_test_tracing();
+    let mut buffers = crate::buffer::BufferManager::new();
+    let mut pm = ProcessManager::new();
+    let threads = crate::emacs_core::threads::ThreadManager::new();
+    let stderrproc = builtin_make_pipe_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("reused-stderr"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+    )
+    .expect("make-pipe-process");
+
+    let _first = builtin_make_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        vec![
+            Value::keyword(":name"),
+            Value::string("first-stderr-owner"),
+            Value::keyword(":command"),
+            Value::list(vec![
+                Value::string(find_bin("sh")),
+                Value::string("-c"),
+                Value::string("printf FIRST >&2"),
+            ]),
+            Value::keyword(":stderr"),
+            stderrproc,
+            Value::keyword(":connection-type"),
+            Value::symbol("pipe"),
+        ],
+        false,
+    )
+    .expect("first make-process");
+
+    let second = builtin_make_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        vec![
+            Value::keyword(":name"),
+            Value::string("second-stderr-owner"),
+            Value::keyword(":command"),
+            Value::list(vec![
+                Value::string(find_bin("sh")),
+                Value::string("-c"),
+                Value::string("printf SECOND >&2"),
+            ]),
+            Value::keyword(":stderr"),
+            stderrproc,
+            Value::keyword(":connection-type"),
+            Value::symbol("pipe"),
+        ],
+        false,
+    )
+    .expect("reusing a consumed stderr pipe should merge stderr");
+    let second_id = second.as_process_id().expect("second process id");
+    let coding_systems = crate::emacs_core::coding::CodingSystemManager::new();
+    let mut output = Vec::new();
+    for _ in 0..100 {
+        if let Some(read) = pm.read_process_output_without_decoding(
+            second_id,
+            ProcessOutputDestination::to_filter(),
+            &coding_systems,
+        ) {
+            output.extend_from_slice(read.undecoded_bytes());
+            if output == b"SECOND" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(output, b"SECOND");
+}
+
+#[test]
+fn stderr_pipe_uses_child_stdout_as_its_live_source() {
+    crate::test_utils::init_test_tracing();
+    let sh = find_bin("sh");
+    let mut buffers = crate::buffer::BufferManager::new();
+    let mut pm = ProcessManager::new();
+    let threads = crate::emacs_core::threads::ThreadManager::new();
+    let stderrproc = builtin_make_pipe_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("child-stdout-stderr"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+    )
+    .expect("make-pipe-process");
+    let stderr_id = stderrproc.as_process_id().expect("stderr pipe process id");
+    let process = builtin_make_process_impl(
+        &mut pm,
+        &mut buffers,
+        &threads,
+        vec![
+            Value::keyword(":name"),
+            Value::string("child-stdout-owner"),
+            Value::keyword(":command"),
+            Value::list(vec![
+                Value::string(sh),
+                Value::string("-c"),
+                Value::string("printf ERR >&2"),
+            ]),
+            Value::keyword(":stderr"),
+            stderrproc,
+            Value::keyword(":connection-type"),
+            Value::symbol("pipe"),
+        ],
+        false,
+    )
+    .expect("make-process");
+    let owner_id = process.as_process_id().expect("owner process id");
+
+    assert!(
+        pm.open_channel_for_module(stderrproc).is_err(),
+        "successful :stderr spawn transfers the pipe writer to the child"
+    );
+    assert!(pm.get(stderr_id).is_some_and(|proc| {
+        proc.kind == ProcessKind::Pipe
+            && proc.live_io.child_stdout.is_some()
+            && proc.live_io.child.is_none()
+    }));
+    assert!(pm.live_process_ids().contains(&stderr_id));
+    assert!(pm.live_process_ids().contains(&owner_id));
+}
+
+#[test]
+fn stderr_pipe_sentinel_runs_before_live_owner_exits() {
+    crate::test_utils::init_test_tracing();
+    let closer = if cfg!(windows) {
+        find_bin("python")
+    } else {
+        find_bin("python3")
+    };
+    let result = eval_one(&format!(
+        r#"(let* ((stderr-buffer (generate-new-buffer " *early-stderr*"))
+                  (owner-buffer (generate-new-buffer " *early-stderr-owner*"))
+                  (pipe-event nil)
+                  (stderr (make-pipe-process
+                           :name "early-stderr"
+                           :buffer stderr-buffer
+                           :sentinel (lambda (process _event)
+                                       (setq pipe-event
+                                             (list (process-status process))))))
+                  (owner (make-process
+                          :name "early-stderr-owner"
+                          :buffer owner-buffer
+                          :stderr stderr
+                          :connection-type 'pipe
+                          :command '("{closer}" "-c"
+                                     "import os; os.close(2); print('READY', flush=True); input()"))))
+             (let ((deadline (+ (float-time) 1.0)))
+               (while (and (null pipe-event)
+                           (< (float-time) deadline))
+                 (accept-process-output nil 0.01)))
+             (let ((before-release
+                    (list pipe-event
+                          (process-status stderr)
+                            (if (process-live-p owner) t nil))))
+               (process-send-string owner "release\n")
+               (while (process-live-p owner)
+                 (accept-process-output owner 0.05))
+               (prog1 (list before-release pipe-event (process-status stderr))
+                 (kill-buffer stderr-buffer)
+                 (kill-buffer owner-buffer))))"#
+    ));
+    assert_eq!(result, "OK (((closed) closed t) (closed) closed)");
+}
+
+#[cfg(windows)]
+#[test]
+fn module_pipe_service_polling_is_nonblocking_before_write_and_services_data() {
+    crate::test_utils::init_test_tracing();
+    let (fd_tx, fd_rx) = mpsc::channel();
+    let (idle_tx, idle_rx) = mpsc::channel();
+    let (write_tx, write_rx) = mpsc::channel();
+    let (data_tx, data_rx) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        let mut ev = Context::new();
+        let buffer_id = ev.buffers.create_buffer(" *module-service-idle*");
+        let process = builtin_make_pipe_process_impl(
+            &mut ev.processes,
+            &mut ev.buffers,
+            &ev.threads,
+            None,
+            ConnectionProcessCodingVariables::unbound(),
+            vec![
+                Value::keyword(":name"),
+                Value::string("module-service-idle"),
+                Value::keyword(":buffer"),
+                Value::make_buffer(buffer_id),
+            ],
+        )
+        .expect("make-pipe-process");
+        let id = process.as_process_id().expect("pipe process id");
+        let fd = ev
+            .processes
+            .open_channel_for_module(process)
+            .expect("open module channel");
+        fd_tx.send(fd).expect("send module fd");
+
+        let request = ProcessOutputServiceRequest::target_only(id);
+        let idle = ev
+            .poll_process_output_for_service_request(&request)
+            .expect("idle service pass");
+        idle_tx
+            .send(idle.has_target_process_activity())
+            .expect("send idle result");
+
+        write_rx.recv().expect("wait for module write");
+        let data = ev
+            .poll_process_output_for_service_request(&request)
+            .expect("data service pass");
+        data_tx
+            .send((
+                data.has_target_process_activity(),
+                ev.buffers
+                    .get(buffer_id)
+                    .expect("module service buffer")
+                    .buffer_string(),
+            ))
+            .expect("send data result");
+    });
+
+    let fd = fd_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("module fd should be published");
+    assert!(
+        !idle_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("idle service pass must return promptly"),
+        "idle module pipe must not report output"
+    );
+
+    let payload = b"module-service-data";
+    unsafe extern "C" {
+        fn _write(fd: std::ffi::c_int, buffer: *const u8, count: u32) -> std::ffi::c_int;
+        fn _close(fd: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    assert_eq!(
+        unsafe { _write(fd, payload.as_ptr(), payload.len() as u32) },
+        payload.len() as std::ffi::c_int
+    );
+    write_tx.send(()).expect("release data service pass");
+
+    let (activity, output) = data_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("written module data should be serviced");
+    assert!(activity);
+    assert_eq!(output, "module-service-data");
+    assert_eq!(unsafe { _close(fd) }, 0);
+    worker.join().expect("service worker");
+}
+
+#[test]
+fn module_channel_writes_to_make_pipe_process() {
+    crate::test_utils::init_test_tracing();
+    let mut buffers = crate::buffer::BufferManager::new();
+    let mut processes = ProcessManager::new();
+    let threads = crate::emacs_core::threads::ThreadManager::new();
+    let process = builtin_make_pipe_process_impl(
+        &mut processes,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("module-channel"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+    )
+    .expect("make-pipe-process");
+    let id = process.as_process_id().expect("pipe process id");
+
+    let fd = processes
+        .open_channel_for_module(process)
+        .expect("open module channel");
+    let payload = b"module-event";
+    #[cfg(unix)]
+    unsafe {
+        assert_eq!(
+            libc::write(fd, payload.as_ptr().cast(), payload.len()),
+            payload.len() as isize
+        );
+        assert_eq!(libc::close(fd), 0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        unsafe extern "C" {
+            fn _write(fd: std::ffi::c_int, buffer: *const u8, count: u32) -> std::ffi::c_int;
+            fn _close(fd: std::ffi::c_int) -> std::ffi::c_int;
+        }
+
+        assert_eq!(
+            _write(fd, payload.as_ptr(), payload.len() as u32),
+            payload.len() as std::ffi::c_int
+        );
+        assert_eq!(_close(fd), 0);
+    }
+
+    let coding_systems = crate::emacs_core::coding::CodingSystemManager::new();
+    let read = processes
+        .read_process_output_without_decoding(
+            id,
+            ProcessOutputDestination::to_filter(),
+            &coding_systems,
+        )
+        .expect("read module event");
+    assert_eq!(read.undecoded_bytes(), payload);
+
+    let second_fd = processes
+        .open_channel_for_module(process)
+        .expect("open second module channel");
+    let second_payload = b"module-event-again";
+    #[cfg(unix)]
+    unsafe {
+        assert_eq!(
+            libc::write(
+                second_fd,
+                second_payload.as_ptr().cast(),
+                second_payload.len()
+            ),
+            second_payload.len() as isize
+        );
+        assert_eq!(libc::close(second_fd), 0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        unsafe extern "C" {
+            fn _write(fd: std::ffi::c_int, buffer: *const u8, count: u32) -> std::ffi::c_int;
+            fn _close(fd: std::ffi::c_int) -> std::ffi::c_int;
+        }
+
+        assert_eq!(
+            _write(
+                second_fd,
+                second_payload.as_ptr(),
+                second_payload.len() as u32
+            ),
+            second_payload.len() as std::ffi::c_int
+        );
+        assert_eq!(_close(second_fd), 0);
+    }
+
+    let second_read = processes
+        .read_process_output_without_decoding(
+            id,
+            ProcessOutputDestination::to_filter(),
+            &coding_systems,
+        )
+        .expect("read second module event");
+    assert_eq!(second_read.undecoded_bytes(), second_payload);
+}
+
+#[test]
+fn stderr_pipe_writer_is_restored_after_pipe_spawn_failure() {
+    crate::test_utils::init_test_tracing();
+    let mut buffers = crate::buffer::BufferManager::new();
+    let mut processes = ProcessManager::new();
+    let threads = crate::emacs_core::threads::ThreadManager::new();
+    let stderrproc = builtin_make_pipe_process_impl(
+        &mut processes,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("pipe-spawn-failure-stderr"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+    )
+    .expect("make-pipe-process");
+    let result = builtin_make_process_impl(
+        &mut processes,
+        &mut buffers,
+        &threads,
+        vec![
+            Value::keyword(":name"),
+            Value::string("pipe-spawn-failure-owner"),
+            Value::keyword(":command"),
+            Value::list(vec![Value::string("neomacs-program-that-does-not-exist")]),
+            Value::keyword(":stderr"),
+            stderrproc,
+            Value::keyword(":connection-type"),
+            Value::symbol("pipe"),
+        ],
+        false,
+    );
+    assert!(result.is_err());
+
+    let fd = processes
+        .open_channel_for_module(stderrproc)
+        .expect("stderr pipe writer restored");
+    let payload = b"pipe-spawn-failure";
+    #[cfg(unix)]
+    unsafe {
+        assert_eq!(
+            libc::write(fd, payload.as_ptr().cast(), payload.len()),
+            payload.len() as isize
+        );
+        assert_eq!(libc::close(fd), 0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        unsafe extern "C" {
+            fn _write(fd: std::ffi::c_int, buffer: *const u8, count: u32) -> std::ffi::c_int;
+            fn _close(fd: std::ffi::c_int) -> std::ffi::c_int;
+        }
+
+        assert_eq!(
+            _write(fd, payload.as_ptr(), payload.len() as u32),
+            payload.len() as std::ffi::c_int
+        );
+        assert_eq!(_close(fd), 0);
+    }
+    let coding_systems = crate::emacs_core::coding::CodingSystemManager::new();
+    let read = processes
+        .read_process_output_without_decoding(
+            stderrproc.as_process_id().expect("stderr pipe id"),
+            ProcessOutputDestination::to_filter(),
+            &coding_systems,
+        )
+        .expect("read restored stderr pipe");
+    assert_eq!(read.undecoded_bytes(), payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_pipe_writer_is_restored_after_pty_spawn_failure() {
+    crate::test_utils::init_test_tracing();
+    let mut buffers = crate::buffer::BufferManager::new();
+    let mut processes = ProcessManager::new();
+    let threads = crate::emacs_core::threads::ThreadManager::new();
+    let stderrproc = builtin_make_pipe_process_impl(
+        &mut processes,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("pty-spawn-failure-stderr"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+    )
+    .expect("make-pipe-process");
+    let result = builtin_make_process_impl(
+        &mut processes,
+        &mut buffers,
+        &threads,
+        vec![
+            Value::keyword(":name"),
+            Value::string("pty-spawn-failure-owner"),
+            Value::keyword(":command"),
+            Value::list(vec![Value::string("neomacs-program-that-does-not-exist")]),
+            Value::keyword(":stderr"),
+            stderrproc,
+        ],
+        true,
+    );
+    assert!(result.is_ok());
+
+    let fd = processes
+        .open_channel_for_module(stderrproc)
+        .expect("stderr pipe writer restored");
+    let payload = b"pty-spawn-failure";
+    unsafe {
+        assert_eq!(
+            libc::write(fd, payload.as_ptr().cast(), payload.len()),
+            payload.len() as isize
+        );
+        assert_eq!(libc::close(fd), 0);
+    }
+    let coding_systems = crate::emacs_core::coding::CodingSystemManager::new();
+    let read = processes
+        .read_process_output_without_decoding(
+            stderrproc.as_process_id().expect("stderr pipe id"),
+            ProcessOutputDestination::to_filter(),
+            &coding_systems,
+        )
+        .expect("read restored stderr pipe");
+    assert_eq!(read.undecoded_bytes(), payload);
+}
+
+#[test]
 fn builtin_process_command_uses_value_slot() {
     crate::test_utils::init_test_tracing();
     let mut pm = ProcessManager::new();
@@ -3112,6 +3682,28 @@ fn async_child_display_probe(
 fn make_process_pipe_uses_the_canonical_child_environment() {
     crate::test_utils::init_test_tracing();
     assert_eq!(async_child_display_probe("nil", "'pipe"), r#"OK ":frame""#);
+}
+
+#[test]
+fn process_output_read_errors_follow_eof_behavior() {
+    crate::test_utils::init_test_tracing();
+    let mut processes = ProcessManager::new();
+    let pid = processes.create_process_lisp(
+        LispString::from_utf8("read-error-eof"),
+        Value::NIL,
+        LispString::from_utf8("read-error-eof"),
+        Vec::new(),
+        ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    let result = process_output_read_from_io_result(
+        processes.get_mut(pid).expect("created process"),
+        &crate::emacs_core::coding::CodingSystemManager::new(),
+        ProcessOutputDestination::to_filter(),
+        ProcessReadOutcome::Failed,
+        &[],
+        1,
+    );
+    assert!(matches!(result, ProcessBytesRead::Eof));
 }
 
 #[cfg(unix)]
