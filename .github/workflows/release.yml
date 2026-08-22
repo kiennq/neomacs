@@ -17,11 +17,71 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare-release:
+    name: prepare release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+            version="${GITHUB_REF_NAME#v}"
+            prerelease=false
+            make_latest=true
+          else
+            base_version="$(
+              cargo metadata --no-deps --format-version 1 |
+                jq -er '.packages[] | select(.name == "neomacs") | .version'
+            )"
+            version="${base_version}.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:7}"
+            tag="v$version"
+            prerelease=false
+            make_latest=true
+          fi
+          tag_commit="$(git rev-parse --verify "${tag}^{commit}" 2>/dev/null || true)"
+          if [[ -z "$tag_commit" ]]; then
+            git tag "$tag" "$GITHUB_SHA"
+          elif [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "release tag $tag points to $tag_commit, expected $GITHUB_SHA" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            git push origin "refs/tags/$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "make_latest=$make_latest" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.metadata.outputs.tag }}
+          name: NEO Emacs ${{ steps.metadata.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ steps.metadata.outputs.prerelease }}
+          make_latest: ${{ steps.metadata.outputs.make_latest }}
+
   # ── Linux x86_64 ──────────────────────────────────────────────────────
   build-linux-x86_64:
     name: build Linux x86_64
+    needs: prepare-release
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -42,6 +102,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           cache-key: release-linux-x86_64
+          cache-workspace-crates: true
           install-nextest: true
 
       - name: Install linuxdeploy
@@ -61,22 +122,17 @@ jobs:
       - name: Build release binaries
         run: cargo xtask fresh-build --release --features neomacs-layout-engine/freetype-bundled
 
-      - name: Set version env
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Configure release version
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          echo "VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          git rev-parse "${RELEASE_TAG}^{commit}" >/dev/null 2>&1 ||
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
 
       - name: Package tarball (x86_64-unknown-linux-gnu)
-        run: |
-          TARGET=x86_64-unknown-linux-gnu
-          STAGING="neomacs-${VERSION}-${TARGET}"
-          mkdir -p "$STAGING"
-          cp target/release/neomacs "$STAGING/"
-          cp target/release/neomacsclient "$STAGING/"
-          cp target/release/neomacs.pdump "$STAGING/"
-          cp -r lisp "$STAGING/"
-          cp -r etc "$STAGING/"
-          cp COPYING "$STAGING/"
-          mkdir -p dist
-          tar czf "dist/${STAGING}.tar.gz" "$STAGING"
+        run: ./scripts/package-release.sh --target x86_64-unknown-linux-gnu --skip-build --no-smoke
 
       - name: Package AppImage
         run: ./scripts/package-appimage.sh --skip-build --no-smoke
@@ -90,22 +146,25 @@ jobs:
       - name: Verify packaged artifacts and GLIBC baseline
         run: ./scripts/test-linux-release-artifacts.sh --tar-version "$VERSION"
 
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Update GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: linux-x86_64
-          path: |
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          files: |
             dist/*.tar.gz
             dist/*.AppImage
             dist/*.deb
             dist/*.rpm
-          if-no-files-found: error
+          fail_on_unmatched_files: true
 
   # ── Linux aarch64 ─────────────────────────────────────────────────────
   build-linux-aarch64:
     name: build Linux aarch64
+    needs: prepare-release
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 120
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -126,27 +185,23 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           cache-key: release-linux-aarch64
+          cache-workspace-crates: true
           target: aarch64-unknown-linux-gnu
 
       - name: Build release binaries
         run: cargo xtask fresh-build --release --features neomacs-layout-engine/freetype-bundled
 
-      - name: Set version env
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Configure release version
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          echo "VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          git rev-parse "${RELEASE_TAG}^{commit}" >/dev/null 2>&1 ||
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
 
       - name: Package tarball (aarch64-unknown-linux-gnu)
-        run: |
-          TARGET=aarch64-unknown-linux-gnu
-          STAGING="neomacs-${VERSION}-${TARGET}"
-          mkdir -p "$STAGING"
-          cp target/release/neomacs "$STAGING/"
-          cp target/release/neomacsclient "$STAGING/"
-          cp target/release/neomacs.pdump "$STAGING/"
-          cp -r lisp "$STAGING/"
-          cp -r etc "$STAGING/"
-          cp COPYING "$STAGING/"
-          mkdir -p dist
-          tar czf "dist/${STAGING}.tar.gz" "$STAGING"
+        run: ./scripts/package-release.sh --target aarch64-unknown-linux-gnu --skip-build --no-smoke
 
       - name: Verify packaged artifact and GLIBC baseline
         run: |
@@ -155,18 +210,21 @@ jobs:
             --tar-version "$VERSION" \
             --formats tar
 
-      - name: Upload Linux aarch64 artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Update GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: linux-aarch64
-          path: dist/*.tar.gz
-          if-no-files-found: error
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
 
   # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────────
   build-macos-aarch64:
     name: build macOS aarch64
+    needs: prepare-release
     runs-on: macos-latest
     timeout-minutes: 120
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -184,45 +242,44 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           cache-key: release-macos-aarch64
+          cache-workspace-crates: true
           target: aarch64-apple-darwin
 
-      - name: Set version env
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Configure release version
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          echo "VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          git rev-parse "${RELEASE_TAG}^{commit}" >/dev/null 2>&1 ||
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
 
       - name: Build release binaries
         run: cargo xtask fresh-build --release --features neomacs-layout-engine/freetype-bundled
 
       - name: Package tarball (aarch64-apple-darwin)
-        run: |
-          TARGET=aarch64-apple-darwin
-          STAGING="neomacs-${VERSION}-${TARGET}"
-          mkdir -p "$STAGING"
-          cp target/release/neomacs "$STAGING/"
-          cp target/release/neomacsclient "$STAGING/"
-          cp target/release/neomacs.pdump "$STAGING/"
-          cp -r lisp "$STAGING/"
-          cp -r etc "$STAGING/"
-          cp COPYING "$STAGING/"
-          mkdir -p dist
-          tar czf "dist/${STAGING}.tar.gz" "$STAGING"
+        run: ./scripts/package-release.sh --target aarch64-apple-darwin --skip-build --no-smoke
 
       - name: Build and package .app + .dmg
         run: ./scripts/package-macos-app.sh --no-smoke
 
-      - name: Upload macOS aarch64 artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Update GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: macos-aarch64
-          path: |
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          files: |
             dist/*.tar.gz
             dist/*.dmg
-          if-no-files-found: error
+          fail_on_unmatched_files: true
 
   # ── Windows x86_64 ────────────────────────────────────────────────────
   build-windows-x86_64:
     name: build Windows x86_64
+    needs: prepare-release
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -238,129 +295,47 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            C:\gstreamer
-            C:\gstreamer-msi-cache
-          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v1
-
-      - name: Install GStreamer SDK
-        if: steps.cache-gstreamer.outputs.cache-hit != 'true'
-        shell: powershell
-        run: ./scripts/setup-windows-gstreamer.ps1 -Install
-
-      - name: Save GStreamer SDK cache
-        if: steps.cache-gstreamer.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            C:\gstreamer
-            C:\gstreamer-msi-cache
-          key: ${{ steps.cache-gstreamer.outputs.cache-primary-key }}
-
-      - name: Configure GStreamer SDK
-        shell: powershell
-        run: ./scripts/setup-windows-gstreamer.ps1
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v3
 
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
         with:
           cache-key: release-windows-msvc-x86_64
+          cache-workspace-crates: true
           target: x86_64-pc-windows-msvc
 
-      - name: Install NSIS
-        run: choco install nsis -y
-
-      - name: Add NSIS to PATH
-        shell: powershell
-        run: Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\NSIS"
-
-      - name: Verify GStreamer pkg-config
+      - name: Configure release version
         shell: bash
-        run: source scripts/windows-gstreamer-env.sh --verify
-
-      - name: Build release binaries
-        shell: bash
-        timeout-minutes: 150
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          source scripts/windows-gstreamer-env.sh
-          # The pdump generation runs neomacs, whose startup expands `~`. The
-          # minimal CI build environment sets USERPROFILE/APPDATA but not HOME,
-          # so `~` would stay literal and `directory-files "~"` would fail. Give
-          # it HOME explicitly (a real Windows session always has one; GNU's
-          # w32.c init_environment likewise guarantees HOME is set).
-          export HOME="${USERPROFILE:-$GITHUB_WORKSPACE}"
-          cargo xtask fresh-build --release --features neomacs-layout-engine/freetype-bundled
+          echo "VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          git rev-parse "${RELEASE_TAG}^{commit}" >/dev/null 2>&1 ||
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
 
-      - name: Set version env (bash)
-        shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-
-      - name: Install zip
-        run: choco install zip -y --no-progress
-
-      - name: Package zip (x86_64-pc-windows-msvc)
-        shell: bash
+      - name: Build and package zip (x86_64-pc-windows-msvc)
+        shell: pwsh
+        timeout-minutes: 160
         run: |
-          TARGET=x86_64-pc-windows-msvc
-          STAGING="neomacs-${VERSION}-${TARGET}"
-          mkdir -p "$STAGING"
-          cp target/release/neomacs.exe "$STAGING/"
-          cp target/release/neomacsclient.exe "$STAGING/"
-          cp target/release/neomacs.pdump "$STAGING/"
-          cp -r lisp "$STAGING/"
-          cp -r etc "$STAGING/"
-          cp COPYING "$STAGING/"
-          ./scripts/vendor-windows-gstreamer-runtime.sh \
-            --package-root "$STAGING" \
-            --bin-dir "$STAGING"
-          mkdir -p dist
-          zip -r "dist/${STAGING}.zip" "$STAGING"
+          # pdump startup expands "~"; hosted Windows jobs may not define HOME.
+          $env:HOME = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:GITHUB_WORKSPACE }
+          ./scripts/emacs-build.ps1 -Version $env:VERSION
 
-      - name: Package .exe installer
-        shell: bash
-        timeout-minutes: 20
-        run: |
-          source scripts/windows-gstreamer-env.sh
-          ./scripts/package-windows-installer.sh --skip-build --no-smoke
-
-      - name: Verify Windows installer ownership contract
-        shell: powershell
-        timeout-minutes: 10
-        run: ./scripts/run-windows-installer-contract.ps1 -ConfirmEphemeralRunner
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Save GStreamer SDK cache
+        if: ${{ !cancelled() && steps.cache-gstreamer.outputs.cache-hit != 'true' && hashFiles('PFiles64/gstreamer/1.0/msvc_x86_64/bin/pkg-config.exe') != '' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          name: windows-x86_64
           path: |
-            dist/*.zip
-            dist/*.exe
-          if-no-files-found: error
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: ${{ steps.cache-gstreamer.outputs.cache-primary-key }}
 
-  # ── GitHub Release ────────────────────────────────────────────────────
-  create-release:
-    name: create release
-    permissions:
-      contents: write
-      discussions: write
-    needs:
-      - build-linux-x86_64
-      - build-linux-aarch64
-      - build-macos-aarch64
-      - build-windows-x86_64
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Create GitHub Release
+      - name: Update GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: NEO Emacs ${{ github.ref_name }}
-          files: dist/*
-          generate_release_notes: true
-          discussion_category_name: Announcements
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          files: dist/*.zip
+          fail_on_unmatched_files: true
