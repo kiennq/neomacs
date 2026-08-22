@@ -9,6 +9,10 @@ inputs:
     description: Expression result controlling whether the cache is saved.
     required: false
     default: "true"
+  cache-workspace-crates:
+    description: Cache compiled workspace crates as well as dependencies.
+    required: false
+    default: "false"
   install-nextest:
     description: Install the cargo-nextest binary.
     required: false
@@ -29,6 +33,7 @@ runs:
         cache-bin: false
         cache-on-failure: true
         cache-save-if: ${{ inputs.cache-save-if }}
+        cache-workspace-crates: ${{ inputs.cache-workspace-crates }}
         # Preserve workspace/config rustflags; the upstream action otherwise
         # injects `-D warnings` globally and changes existing build behavior.
         rustflags: ""
