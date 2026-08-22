@@ -3286,7 +3286,11 @@ fn run_compile_main(
     }
 
     if !errors.is_empty() {
-        eprintln!("  ERROR  {} files failed to byte-compile:", errors.len());
+        eprintln!(
+            "  ERROR  {} compiler invocation{} failed:",
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" }
+        );
         for e in &errors {
             eprintln!("    - {}", e);
         }
@@ -3298,7 +3302,7 @@ fn run_compile_main(
 
 fn compile_main_failure_summary(errors: &[String]) -> String {
     format!(
-        "compile-main failed to byte-compile {} file{}",
+        "compile-main failed in {} compiler invocation{}",
         errors.len(),
         if errors.len() == 1 { "" } else { "s" }
     )
@@ -3405,21 +3409,24 @@ fn run_compile_main_parallel(
     let mut errors = Vec::new();
 
     for wave in waves {
+        let batches = compile_main_batches(options.native_comp, wave);
         let wave_errors = if options.dry_run {
-            wave.iter()
-                .filter_map(|source| {
-                    run_final_compile_main_source(options, paths, envs, source)
+            batches
+                .iter()
+                .filter_map(|sources| {
+                    run_final_compile_main_sources(options, paths, envs, sources)
                         .err()
-                        .map(|err| format!("{} ({err})", source.display()))
+                        .map(|err| format!("{} ({err})", compile_main_batch_label(sources)))
                 })
                 .collect::<Vec<_>>()
         } else {
             pool.install(|| {
-                wave.par_iter()
-                    .filter_map(|source| {
-                        run_final_compile_main_source(options, paths, envs, source)
+                batches
+                    .par_iter()
+                    .filter_map(|sources| {
+                        run_final_compile_main_sources(options, paths, envs, sources)
                             .err()
-                            .map(|err| format!("{} ({err})", source.display()))
+                            .map(|err| format!("{} ({err})", compile_main_batch_label(sources)))
                     })
                     .collect::<Vec<_>>()
             })
@@ -3431,6 +3438,28 @@ fn run_compile_main_parallel(
     Ok(errors)
 }
 
+const COMPILE_MAIN_BATCH_SIZE: usize = 16;
+
+fn compile_main_batches(native_comp: bool, sources: Vec<PathBuf>) -> Vec<Vec<PathBuf>> {
+    let batch_size = if native_comp {
+        1
+    } else {
+        COMPILE_MAIN_BATCH_SIZE
+    };
+    sources
+        .chunks(batch_size)
+        .map(<[PathBuf]>::to_vec)
+        .collect()
+}
+
+fn compile_main_batch_label(sources: &[PathBuf]) -> String {
+    sources
+        .iter()
+        .map(|source| source.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn run_compile_main_serial(
     options: &FreshBuildOptions,
     paths: &PipelinePaths,
@@ -3440,7 +3469,7 @@ fn run_compile_main_serial(
     sources
         .iter()
         .filter_map(|source| {
-            run_final_compile_main_source(options, paths, envs, source)
+            run_final_compile_main_sources(options, paths, envs, std::slice::from_ref(source))
                 .err()
                 .map(|err| format!("{} ({err})", source.display()))
         })
@@ -3580,13 +3609,20 @@ fn run_preloaded_lisp_byte_compile_source(
     )
 }
 
-fn run_final_compile_main_source(
+fn run_final_compile_main_sources(
     options: &FreshBuildOptions,
     paths: &PipelinePaths,
     envs: &[(OsString, OsString)],
-    source: &Path,
+    sources: &[PathBuf],
 ) -> Result<()> {
-    run_byte_compile_source_with(options, compile_main_emacs(paths), envs, source)
+    let args = compile_main_args_for_sources(options.native_comp, sources);
+    run_command(
+        options,
+        &options.repo_root,
+        compile_main_emacs(paths),
+        &args,
+        envs,
+    )
 }
 
 fn run_byte_compile_source_with(
@@ -3595,7 +3631,7 @@ fn run_byte_compile_source_with(
     envs: &[(OsString, OsString)],
     source: &Path,
 ) -> Result<()> {
-    let args = compile_main_args_for_source(options.native_comp, source);
+    let args = compile_main_args_for_sources(options.native_comp, std::slice::from_ref(&source));
     run_command(options, &options.repo_root, program, &args, envs)
 }
 
@@ -3808,7 +3844,10 @@ fn gnu_no_byte_compile_marker_line(line: &str) -> bool {
     false
 }
 
-fn compile_main_args_for_source(native_comp: bool, source: &Path) -> Vec<OsString> {
+fn compile_main_args_for_sources<T: AsRef<Path>>(
+    native_comp: bool,
+    sources: &[T],
+) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--batch"),
         OsString::from("--no-site-file"),
@@ -3827,7 +3866,11 @@ fn compile_main_args_for_source(native_comp: bool, source: &Path) -> Vec<OsStrin
         args.push(OsString::from("-f"));
         args.push(OsString::from("batch-byte-compile"));
     }
-    args.push(source.as_os_str().to_os_string());
+    args.extend(
+        sources
+            .iter()
+            .map(|source| source.as_ref().as_os_str().to_os_string()),
+    );
     args
 }
 
