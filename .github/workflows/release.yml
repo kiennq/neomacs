@@ -9,9 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  RUST_LOG: info
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true

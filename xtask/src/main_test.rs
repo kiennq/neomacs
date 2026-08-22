@@ -226,6 +226,16 @@ fn release_build_jobs_allow_two_hours() {
 }
 
 #[test]
+fn release_workflow_keeps_bootstrap_logging_quiet() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    assert!(
+        !workflow.contains("RUST_LOG: info"),
+        "release bootstrap must not emit info-level tracing"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -283,6 +293,21 @@ fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
         .expect("reject unknown Linux CI profile");
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown profile: typo"));
+}
+
+#[test]
+fn release_profile_balances_optimization_and_build_parallelism() {
+    let workspace_manifest = include_str!("../../Cargo.toml");
+    let release_profile = workspace_manifest
+        .split_once("[profile.release]")
+        .expect("workspace must define a release profile")
+        .1
+        .split("\n[")
+        .next()
+        .unwrap();
+
+    assert!(release_profile.contains("lto = \"thin\""));
+    assert!(release_profile.contains("codegen-units = 4"));
 }
 
 #[test]
@@ -1630,17 +1655,17 @@ fn compile_main_sources_follow_gnu_no_byte_compile_filter() {
 }
 
 #[test]
-fn compile_main_failure_summary_reports_failed_file_count() {
+fn compile_main_failure_summary_reports_failed_invocation_count() {
     assert_eq!(
         compile_main_failure_summary(&["/repo/lisp/simple.el".to_string()]),
-        "compile-main failed to byte-compile 1 file"
+        "compile-main failed in 1 compiler invocation"
     );
     assert_eq!(
         compile_main_failure_summary(&[
             "/repo/lisp/simple.el".to_string(),
             "/repo/lisp/calendar/calendar.el".to_string(),
         ]),
-        "compile-main failed to byte-compile 2 files"
+        "compile-main failed in 2 compiler invocations"
     );
 }
 
@@ -1781,8 +1806,14 @@ fn compile_first_args_match_gnu_native_shape() {
 }
 
 #[test]
-fn compile_main_args_match_gnu_non_native_shape() {
-    let args = compile_main_args_for_source(false, Path::new("/tmp/simple.el"));
+fn compile_main_args_batch_non_native_sources_in_one_process() {
+    let args = compile_main_args_for_sources(
+        false,
+        &[
+            PathBuf::from("/tmp/simple.el"),
+            PathBuf::from("/tmp/calendar.el"),
+        ],
+    );
     assert_eq!(
         args,
         vec![
@@ -1796,13 +1827,14 @@ fn compile_main_args_match_gnu_non_native_shape() {
             OsString::from("-f"),
             OsString::from("batch-byte-compile"),
             OsString::from("/tmp/simple.el"),
+            OsString::from("/tmp/calendar.el"),
         ]
     );
 }
 
 #[test]
-fn compile_main_args_match_gnu_native_shape() {
-    let args = compile_main_args_for_source(true, Path::new("/tmp/simple.el"));
+fn compile_main_args_keep_native_source_single() {
+    let args = compile_main_args_for_sources(true, &[PathBuf::from("/tmp/simple.el")]);
     assert_eq!(
         args,
         vec![
@@ -1818,6 +1850,37 @@ fn compile_main_args_match_gnu_native_shape() {
             OsString::from("-f"),
             OsString::from("batch-byte+native-compile"),
             OsString::from("/tmp/simple.el"),
+        ]
+    );
+}
+
+#[test]
+fn compile_main_batches_cap_windows_command_size() {
+    let sources = (0..17)
+        .map(|index| PathBuf::from(format!("/tmp/file-{index}.el")))
+        .collect::<Vec<_>>();
+
+    let batches = compile_main_batches(false, sources);
+
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].len(), 16);
+    assert_eq!(batches[1], vec![PathBuf::from("/tmp/file-16.el")]);
+}
+
+#[test]
+fn compile_main_batches_keep_native_sources_isolated() {
+    let sources = (0..3)
+        .map(|index| PathBuf::from(format!("/tmp/file-{index}.el")))
+        .collect::<Vec<_>>();
+
+    let batches = compile_main_batches(true, sources);
+
+    assert_eq!(
+        batches,
+        vec![
+            vec![PathBuf::from("/tmp/file-0.el")],
+            vec![PathBuf::from("/tmp/file-1.el")],
+            vec![PathBuf::from("/tmp/file-2.el")],
         ]
     );
 }
