@@ -719,6 +719,10 @@ pub(crate) struct DisplaySourceMappedText {
     /// `None` retains the covered-start rule used by escape/composition
     /// expansions.
     pub(crate) glyph_string_start: Option<DisplaySourcePosition>,
+    /// Optional homogeneous named face carried by a display-table glyph
+    /// vector. Mixed or zero faces leave this unset and inherit the active
+    /// buffer face.
+    pub(crate) face_name: Option<Box<str>>,
 }
 
 impl DisplaySourceMappedText {
@@ -726,6 +730,7 @@ impl DisplaySourceMappedText {
         Self {
             text: text.into(),
             glyph_string_start: None,
+            face_name: None,
         }
     }
 
@@ -740,7 +745,17 @@ impl DisplaySourceMappedText {
         Self {
             text: text.into(),
             glyph_string_start: Some(glyph_string_start),
+            face_name: None,
         }
+    }
+
+    pub(crate) fn with_face_name(mut self, face_name: Option<String>) -> Self {
+        self.face_name = face_name.map(Into::into);
+        self
+    }
+
+    pub(crate) fn face_name(&self) -> Option<&str> {
+        self.face_name.as_deref()
     }
 
     /// Keep the displayed text and its glyph-coordinate origin transactional
@@ -756,6 +771,7 @@ impl DisplaySourceMappedText {
             glyph_string_start: self
                 .glyph_string_start
                 .map(|start| start.advanced_by(emitted_chars, split_byte)),
+            face_name: self.face_name,
         })
     }
 }

@@ -670,7 +670,7 @@ impl<'a, B: LayoutBufferView + ?Sized> BufferTextSourceCursor<'a, B> {
             // A char that the active display table remaps to a glyph vector must
             // break the plain text run so it is emitted as its own item (GNU
             // `DISP_CHAR_VECTOR` is consulted per character in the producer).
-            if self.display_table_glyphs(ch).is_some() {
+            if crate::neovm_bridge::buffer_display_table_glyph_vector_p(self.buffer, ch) {
                 break;
             }
             end = end.add_len(CharLen::new(1));
@@ -679,10 +679,13 @@ impl<'a, B: LayoutBufferView + ?Sized> BufferTextSourceCursor<'a, B> {
     }
 
     /// Resolve the active display table's glyph vector for `ch`, returning the
-    /// decoded glyph characters to display in place of `ch` (GNU
+    /// decoded glyph characters and any homogeneous face to display in place of `ch` (GNU
     /// `DISP_CHAR_VECTOR`).  `None` is the hot path (no table / no entry / not a
     /// vector) and leaves `ch` to render literally.
-    fn display_table_glyphs(&self, ch: char) -> Option<String> {
+    fn display_table_glyphs(
+        &self,
+        ch: char,
+    ) -> Option<crate::neovm_bridge::BufferDisplayTableGlyphs> {
         crate::neovm_bridge::buffer_display_table_glyphs(self.buffer, ch)
     }
 
@@ -752,6 +755,7 @@ impl<'a, B: LayoutBufferView + ?Sized> BufferTextSourceCursor<'a, B> {
         // decoded glyph is appended as a real glyph (a `?\t` glyph re-expands
         // through the ordinary tab path), keeping the row non-blank.
         if let Some(glyphs) = self.display_table_glyphs(ch) {
+            let crate::neovm_bridge::BufferDisplayTableGlyphs { text, face_name } = glyphs;
             self.char_pos = start.add_len(CharLen::new(1));
             // GNU iterates a display-table entry element-by-element and decides
             // end-of-line on the DISPLAYED char: `ITERATOR_AT_END_OF_LINE_P`
@@ -764,13 +768,15 @@ impl<'a, B: LayoutBufferView + ?Sized> BufferTextSourceCursor<'a, B> {
             // the next row resumes on the following char. An entry WITHOUT a
             // trailing `\n` (e.g. `[$]`) keeps the plain no-break replacement,
             // matching GNU (the newline's break is fully replaced -> lines join).
-            if ch == '\n' && glyphs.ends_with('\n') {
-                let prefix = glyphs[..glyphs.len() - '\n'.len_utf8()].to_string();
+            if ch == '\n' && text.ends_with('\n') {
+                let prefix = text[..text.len() - '\n'.len_utf8()].to_string();
                 return Some(
                     DisplayItem::new(
                         self.span(start, self.char_pos),
                         face,
-                        DisplayItemKind::SourceMappedText(DisplaySourceMappedText::new(prefix)),
+                        DisplayItemKind::SourceMappedText(
+                            DisplaySourceMappedText::new(prefix).with_face_name(face_name),
+                        ),
                     )
                     .with_layout(layout)
                     .with_break_after_row(),
@@ -780,7 +786,9 @@ impl<'a, B: LayoutBufferView + ?Sized> BufferTextSourceCursor<'a, B> {
                 DisplayItem::new(
                     self.span(start, self.char_pos),
                     face,
-                    DisplayItemKind::SourceMappedText(DisplaySourceMappedText::new(glyphs)),
+                    DisplayItemKind::SourceMappedText(
+                        DisplaySourceMappedText::new(text).with_face_name(face_name),
+                    ),
                 )
                 .with_layout(layout),
             );

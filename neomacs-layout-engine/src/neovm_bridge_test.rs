@@ -1815,17 +1815,142 @@ fn buffer_display_table_glyphs_decodes_per_char_vector() {
 
     let buf = evaluator.buffer_manager().get(buf_id).unwrap();
     assert_eq!(
-        buffer_display_table_glyphs(buf, '\t').as_deref(),
-        Some(">\t"),
+        buffer_display_table_glyphs(buf, '\t').map(|glyphs| glyphs.text),
+        Some(">\t".to_string()),
         "tab maps to '>' then a literal tab glyph"
     );
-    assert_eq!(buffer_display_table_glyphs(buf, 'x').as_deref(), Some("A"));
+    assert_eq!(
+        buffer_display_table_glyphs(buf, 'x').map(|glyphs| glyphs.text),
+        Some("A".to_string())
+    );
     // Empty vector -> Some("") (display nothing), distinct from None (no entry).
-    assert_eq!(buffer_display_table_glyphs(buf, 'q').as_deref(), Some(""));
+    assert_eq!(
+        buffer_display_table_glyphs(buf, 'q').map(|glyphs| glyphs.text),
+        Some(String::new())
+    );
     // A plain-character entry is NOT a glyph vector -> None (render literally).
     assert_eq!(buffer_display_table_glyphs(buf, 'n'), None);
     // An unmapped char -> None (the hot path).
     assert_eq!(buffer_display_table_glyphs(buf, 'z'), None);
+}
+
+#[test]
+fn buffer_display_table_glyphs_reports_homogeneous_visible_face() {
+    let mut evaluator = neovm_core::emacs_core::Context::new();
+    let buf_id = evaluator
+        .buffer_manager_mut()
+        .create_buffer("*disp-char-face*");
+    let face_id = evaluator
+        .eval_str("(get 'bold 'face)")
+        .expect("bold face id")
+        .as_fixnum()
+        .expect("numeric face id");
+    let table = Value::make_char_table(Value::symbol("display-table"), Value::NIL, 6);
+    neovm_core::emacs_core::chartable::ct_set_single(
+        &table,
+        '\n' as i64,
+        Value::vector(vec![
+            Value::cons(Value::fixnum('↪' as i64), Value::fixnum(face_id)),
+            Value::cons(Value::fixnum('\n' as i64), Value::fixnum(face_id + 1)),
+        ]),
+    );
+    neovm_core::emacs_core::chartable::ct_set_single(
+        &table,
+        'm' as i64,
+        Value::vector(vec![
+            Value::cons(Value::fixnum('a' as i64), Value::fixnum(face_id)),
+            Value::cons(Value::fixnum('b' as i64), Value::fixnum(face_id + 1)),
+        ]),
+    );
+    neovm_core::emacs_core::chartable::ct_set_single(
+        &table,
+        'z' as i64,
+        Value::vector(vec![
+            Value::cons(Value::fixnum('a' as i64), Value::fixnum(0)),
+            Value::cons(Value::fixnum('b' as i64), Value::fixnum(0)),
+        ]),
+    );
+    neovm_core::emacs_core::chartable::ct_set_single(
+        &table,
+        'p' as i64,
+        Value::vector(vec![Value::fixnum(('P' as i64) | (face_id << 22))]),
+    );
+    neovm_core::emacs_core::chartable::ct_set_single(
+        &table,
+        'n' as i64,
+        Value::vector(vec![Value::fixnum(('N' as i64) | (-1i64 << 22))]),
+    );
+    if let Some(buf) = evaluator.buffer_manager_mut().get_mut(buf_id) {
+        set_buffer_text(buf, "\n");
+        buf.set_buffer_local("buffer-display-table", table);
+    }
+
+    let buf = evaluator.buffer_manager().get(buf_id).unwrap();
+    let decoded = buffer_display_table_glyphs(buf, '\n').expect("display-table vector");
+    assert_eq!(decoded.text, "↪\n");
+    assert_eq!(
+        decoded.face_name.as_deref(),
+        Some("bold"),
+        "a trailing newline with another face is excluded from the visible-face comparison"
+    );
+    assert_eq!(
+        buffer_display_table_glyphs(buf, 'm')
+            .expect("mixed display-table vector")
+            .face_name,
+        None,
+        "mixed visible faces must not select a face"
+    );
+    assert_eq!(
+        buffer_display_table_glyphs(buf, 'z')
+            .expect("zero-face display-table vector")
+            .face_name,
+        None,
+        "zero face ids must not select a face"
+    );
+    assert_eq!(
+        buffer_display_table_glyphs(buf, 'p')
+            .expect("packed-face display-table vector")
+            .face_name
+            .as_deref(),
+        Some("bold"),
+        "packed positive face ids must resolve to their face name"
+    );
+    assert_eq!(
+        buffer_display_table_glyphs(buf, 'n')
+            .expect("negative-face display-table vector")
+            .face_name,
+        None,
+        "negative packed face ids must not select a face"
+    );
+}
+
+#[test]
+fn glyph_code_face_encoding_accepts_positive_and_rejects_nonpositive_ids() {
+    let positive = ('A' as i64) | (7i64 << 22);
+    assert_eq!(
+        glyph_code_parts(Value::fixnum(positive)),
+        Some(('A', Some(7)))
+    );
+
+    let negative = ('A' as i64) | (-1i64 << 22);
+    assert_eq!(
+        glyph_code_parts(Value::fixnum(negative)),
+        Some(('A', None)),
+        "packed face ids use signed arithmetic shift and reject negative ids"
+    );
+    let zero = 'A' as i64;
+    assert_eq!(
+        glyph_code_parts(Value::fixnum(zero)),
+        Some(('A', None)),
+        "packed zero face id is not a named face"
+    );
+
+    let negative_cons = Value::cons(Value::fixnum('A' as i64), Value::fixnum(-1));
+    assert_eq!(
+        glyph_code_parts(negative_cons),
+        Some(('A', None)),
+        "cons face ids reject negative ids"
+    );
 }
 
 #[test]

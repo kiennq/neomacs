@@ -1115,21 +1115,30 @@ fn buffer_fill_column_indicator(buffer: &Buffer, obarray: &Obarray) -> Option<(i
 /// table's extra slots (`DISP_INVIS_VECTOR`, `disptab.h:35` -> `extras[4]`).
 const DISP_INVIS_VECTOR_SLOT: usize = 4;
 
-/// Decode a display-table glyph code to its character.
-///
+/// The decoded text and optional homogeneous nonzero Lisp face carried by a
+/// display-table glyph vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferDisplayTableGlyphs {
+    pub(crate) text: String,
+    pub(crate) face_name: Option<String>,
+}
+
 /// `make-glyph-code` (`disp-table.el`) encodes a glyph as either a bare
 /// character fixnum, a fixnum packing the face id above the low 22 char bits,
-/// or a `(char . face-id)` cons when the face id needs more than 6 bits.  Here
-/// we only need the character; the face is currently rendered with the active
-/// (preceding text) face, matching GNU's common `setup_for_ellipsis` path
-/// where the glyph carries the default face.
-fn glyph_code_char(glyph: Value) -> Option<char> {
-    let code = if glyph.is_cons() {
-        glyph.cons_car().as_fixnum()?
+/// or a `(char . face-id)` cons when the face id needs more than 6 bits.
+fn glyph_code_parts(glyph: Value) -> Option<(char, Option<i64>)> {
+    let (code, face_id) = if glyph.is_cons() {
+        (glyph.cons_car().as_fixnum()?, glyph.cons_cdr().as_fixnum())
     } else {
-        glyph.as_fixnum()?
+        let code = glyph.as_fixnum()?;
+        (code, Some(code >> 22))
     };
-    char::from_u32((code as u64 & 0x3F_FFFF) as u32)
+    let ch = char::from_u32((code as u64 & 0x3F_FFFF) as u32)?;
+    Some((ch, face_id.filter(|face_id| *face_id > 0)))
+}
+
+fn glyph_code_char(glyph: Value) -> Option<char> {
+    glyph_code_parts(glyph).map(|(ch, _)| ch)
 }
 
 /// The active display table for a buffer: `buffer-display-table`, else
@@ -1147,6 +1156,21 @@ fn active_buffer_display_table<B: LayoutBufferView + ?Sized>(buffer: &B) -> Opti
 /// remap arbitrary chars, so such buffers stay on the buffer pipeline.
 pub(crate) fn buffer_has_active_display_table<B: LayoutBufferView + ?Sized>(buffer: &B) -> bool {
     active_buffer_display_table(buffer).is_some()
+}
+
+/// Whether the active display table maps `ch` to a glyph vector. This keeps
+/// text-run scanning on the cheap presence path; decoding is deferred until
+/// the mapped item is emitted.
+pub(crate) fn buffer_display_table_glyph_vector_p<B: LayoutBufferView + ?Sized>(
+    buffer: &B,
+    ch: char,
+) -> bool {
+    let Some(table) = active_buffer_display_table(buffer) else {
+        return false;
+    };
+    neovm_core::emacs_core::chartable::ct_ref(&table, ch as i64)
+        .as_vector_data()
+        .is_some()
 }
 
 /// Resolve the ellipsis string GNU renders for invisible/selective-display
@@ -1173,34 +1197,49 @@ pub(crate) fn buffer_invisible_ellipsis_text<B: LayoutBufferView>(buffer: &B) ->
 }
 
 /// Resolve the per-character display-vector for `ch` from the active display
-/// table, returning the decoded glyph characters to render in place of `ch`.
+/// table, returning the decoded glyph characters and an optional homogeneous
+/// face name to render in place of `ch`.
 ///
 /// Mirrors GNU `get_next_display_element` (`xdisp.c:8463`): `dv =
 /// DISP_CHAR_VECTOR(it->dp, c)`; when `dv` is a non-empty vector the character
 /// is displayed as the sequence of glyph codes in the vector (each decoded by
 /// `GLYPH_CODE_CHAR = code & MAX_CHAR`), all sharing the original char's buffer
-/// position.  We return the decoded glyph string so the caller can emit it as a
-/// single `SourceMappedText` item over the one source char (the whole vector is
-/// one display item, consumed once — matching GNU's `dpvec_char_len`-once
-/// advance), and so a `?\t` glyph inside the vector re-expands through the
-/// normal tab path.
+/// position.  We return the decoded glyph string and face hint so the caller
+/// can emit it as a single `SourceMappedText` item over the one source char
+/// (the whole vector is one display item, consumed once — matching GNU's
+/// `dpvec_char_len`-once advance), and so a `?\t` glyph inside the vector
+/// re-expands through the normal tab path.
 ///
 /// Returns `None` (the hot path) when there is no active display table, no
 /// entry for `ch`, or the entry is not a vector — leaving `ch` to render
 /// literally.  An EMPTY vector means "display nothing"; we return `Some("")`
 /// so the char is replaced by no glyphs (GNU skips it entirely).
 ///
-/// Per-glyph faces (`GLYPH_CODE_FACE = code >> 22`) are not yet honored here:
-/// the whole mapped vector inherits the source char's active face, which is
-/// correct for the common `make-glyph-code` form with no face (face id 0).
 pub(crate) fn buffer_display_table_glyphs<B: LayoutBufferView + ?Sized>(
     buffer: &B,
     ch: char,
-) -> Option<String> {
+) -> Option<BufferDisplayTableGlyphs> {
     let table = active_buffer_display_table(buffer)?;
     let entry = neovm_core::emacs_core::chartable::ct_ref(&table, ch as i64);
     let glyphs = entry.as_vector_data()?;
-    Some(glyphs.iter().filter_map(|g| glyph_code_char(*g)).collect())
+    let decoded: Vec<_> = glyphs
+        .iter()
+        .filter_map(|glyph| glyph_code_parts(*glyph))
+        .collect();
+    let text = decoded.iter().map(|(ch, _)| *ch).collect();
+    let visible = decoded
+        .last()
+        .is_some_and(|(last, _)| *last == '\n' && ch == '\n')
+        .then(|| &decoded[..decoded.len() - 1])
+        .unwrap_or(&decoded);
+    let face_id = visible
+        .first()
+        .and_then(|(_, face_id)| *face_id)
+        .filter(|face_id| visible.iter().all(|(_, other)| *other == Some(*face_id)));
+    Some(BufferDisplayTableGlyphs {
+        text,
+        face_name: face_id.and_then(neovm_core::emacs_core::xfaces::face_name_for_id),
+    })
 }
 
 pub(crate) fn buffer_selective_display<B: LayoutBufferView>(buffer: &B) -> i32 {

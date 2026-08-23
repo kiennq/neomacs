@@ -1,5 +1,14 @@
 use super::*;
 
+#[test]
+fn face_name_for_id_round_trips_known_face_ids() {
+    crate::test_utils::init_test_tracing();
+    let face_id = face_id_for_name("bold").expect("bootstrap face id");
+    assert_eq!(face_name_for_id(face_id).as_deref(), Some("bold"));
+    assert_eq!(face_name_for_id(-1), None);
+    assert_eq!(face_name_for_id(-1), None);
+}
+
 // --- FaceColorResolver::realize (spec -> realized color bridge) ---
 
 #[test]

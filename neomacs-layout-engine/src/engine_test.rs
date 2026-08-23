@@ -4952,6 +4952,212 @@ fn layout_frame_rust_display_table_maps_char_to_glyph_vector() {
 }
 
 #[test]
+fn layout_frame_rust_display_table_newline_glyph_uses_face_and_breaks_row() {
+    let mut eval = Context::new();
+    let buf_id = eval
+        .buffer_manager()
+        .current_buffer()
+        .expect("current buffer")
+        .id();
+    {
+        let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
+        buffer.insert("a\nb");
+    }
+    let frame_id =
+        eval.frame_manager_mut()
+            .create_frame("display-table-newline-face", 360, 180, buf_id);
+    assert!(eval.frame_manager_mut().select_frame(frame_id));
+    let face_setup = eval.eval_str_each(
+        "(internal-set-lisp-face-attribute \
+          'whitespace-newline :foreground \"#555555\" (selected-frame))",
+    );
+    assert!(
+        face_setup.iter().all(Result::is_ok),
+        "display-table face setup must succeed, got {face_setup:?}"
+    );
+    let face_id = eval
+        .eval_str("(get 'whitespace-newline 'face)")
+        .expect("face-id")
+        .as_fixnum()
+        .expect("numeric Lisp face id");
+    {
+        let table = Value::make_char_table(Value::symbol("display-table"), Value::NIL, 6);
+        let glyphs = Value::vector(vec![
+            Value::cons(Value::fixnum('↪' as i64), Value::fixnum(face_id)),
+            Value::fixnum('\n' as i64),
+        ]);
+        neovm_core::emacs_core::chartable::ct_set_single(&table, '\n' as i64, glyphs);
+        eval.buffer_manager_mut()
+            .get_mut(buf_id)
+            .expect("buffer")
+            .set_buffer_local("buffer-display-table", table);
+    }
+
+    let selected_window = eval
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+    let mut engine = LayoutEngine::new();
+    engine.layout_frame_rust(&mut eval, frame_id);
+
+    let state = engine
+        .last_frame_display_state
+        .as_ref()
+        .expect("display state");
+    let entry = state
+        .window_matrices
+        .iter()
+        .find(|entry| entry.window_id.get() == selected_window.0 as i64)
+        .expect("selected window matrix");
+    let text_rows: Vec<_> = entry
+        .matrix
+        .rows
+        .iter()
+        .filter(|row| row.enabled && row.role == GlyphRowRole::Text && row.displays_text)
+        .collect();
+    assert!(
+        text_rows.len() >= 2,
+        "display newline must break into two rows"
+    );
+
+    let first_row_glyphs = &text_rows[0].glyphs[GlyphArea::Text.index()];
+    let arrow = first_row_glyphs
+        .iter()
+        .find(|glyph| matches!(glyph.glyph_type, GlyphType::Char { ch: '↪' }))
+        .expect("visible display-table arrow");
+    let arrow_face = state.faces.get(&arrow.face_id).expect("arrow face");
+    let base = first_row_glyphs
+        .iter()
+        .find(|glyph| matches!(glyph.glyph_type, GlyphType::Char { ch: 'a' }))
+        .expect("surrounding base glyph");
+    let base_face = state.faces.get(&base.face_id).expect("base face");
+    assert_ne!(
+        arrow.face_id, base.face_id,
+        "display-table arrow must use a distinct resolved face"
+    );
+    assert_eq!(
+        arrow_face.foreground,
+        neomacs_display_protocol::types::Color::from_pixel(0x00555555),
+        "display-table arrow must use whitespace-newline foreground"
+    );
+    assert_ne!(
+        arrow_face.foreground, base_face.foreground,
+        "display-table arrow foreground must differ from surrounding text"
+    );
+    assert!(
+        text_rows[1].glyphs[GlyphArea::Text.index()]
+            .iter()
+            .any(|glyph| matches!(glyph.glyph_type, GlyphType::Char { ch: 'b' })),
+        "the trailing newline glyph must still break the row"
+    );
+}
+
+#[test]
+fn layout_frame_rust_display_table_face_preserves_attributes_and_height() {
+    use neomacs_display_protocol::face::FaceAttributes;
+    use neomacs_display_protocol::types::Color;
+
+    let mut eval = Context::new();
+    let buf_id = eval
+        .buffer_manager()
+        .current_buffer()
+        .expect("current buffer")
+        .id();
+    {
+        let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
+        buffer.insert("axb\n");
+    }
+    let frame_id =
+        eval.frame_manager_mut()
+            .create_frame("display-table-full-face", 360, 180, buf_id);
+    assert!(eval.frame_manager_mut().select_frame(frame_id));
+    let face_setup = eval.eval_str_each(
+        "(internal-set-lisp-face-attribute \
+          '__display-table-face :background \"#112233\" (selected-frame))\
+         (internal-set-lisp-face-attribute \
+          '__display-table-face :underline t (selected-frame))\
+         (internal-set-lisp-face-attribute \
+          '__display-table-face :weight 'bold (selected-frame))",
+    );
+    assert!(
+        face_setup.iter().all(Result::is_ok),
+        "display-table face setup must succeed, got {face_setup:?}"
+    );
+    let face_id = eval
+        .eval_str("(get '__display-table-face 'face)")
+        .expect("face-id")
+        .as_fixnum()
+        .expect("numeric Lisp face id");
+    {
+        let table = Value::make_char_table(Value::symbol("display-table"), Value::NIL, 6);
+        neovm_core::emacs_core::chartable::ct_set_single(
+            &table,
+            'x' as i64,
+            Value::vector(vec![Value::cons(
+                Value::fixnum('<' as i64),
+                Value::fixnum(face_id),
+            )]),
+        );
+        let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
+        buffer.set_buffer_local("buffer-display-table", table);
+        buffer.put_text_property(
+            1,
+            2,
+            Value::symbol("display"),
+            Value::list(vec![Value::keyword(":height"), Value::fixnum(2)]),
+        );
+    }
+
+    let selected_window = eval
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+    let mut engine = LayoutEngine::new();
+    engine.layout_frame_rust(&mut eval, frame_id);
+
+    let state = engine
+        .last_frame_display_state
+        .as_ref()
+        .expect("display state");
+    let entry = state
+        .window_matrices
+        .iter()
+        .find(|entry| entry.window_id.get() == selected_window.0 as i64)
+        .expect("selected window matrix");
+    let row = entry
+        .matrix
+        .rows
+        .iter()
+        .find(|row| row.enabled && row.role == GlyphRowRole::Text && row.displays_text)
+        .expect("text row");
+    let text_glyphs = &row.glyphs[GlyphArea::Text.index()];
+    let mapped = text_glyphs
+        .iter()
+        .find(|glyph| matches!(glyph.glyph_type, GlyphType::Char { ch: '<' }))
+        .expect("mapped glyph");
+    let base = text_glyphs
+        .iter()
+        .find(|glyph| matches!(glyph.glyph_type, GlyphType::Char { ch: 'a' }))
+        .expect("base glyph");
+    let mapped_face = state.faces.get(&mapped.face_id).expect("mapped face");
+    let base_face = state.faces.get(&base.face_id).expect("base face");
+
+    assert_eq!(mapped_face.background, Color::from_pixel(0x00112233));
+    assert_eq!(
+        mapped_face.foreground, base_face.foreground,
+        "the explicit display-table face leaves the base foreground unchanged"
+    );
+    assert_eq!(mapped_face.font_weight, 700);
+    assert!(mapped_face.attributes.contains(FaceAttributes::UNDERLINE));
+    assert!(
+        mapped_face.font_size > base_face.font_size,
+        "height modifier must apply after the display-table face merge"
+    );
+}
+
+#[test]
 fn layout_frame_rust_display_table_replaces_newline_without_row_break() {
     let text = "a\nb\n";
     let setup = |buffer: &mut neovm_core::buffer::Buffer, _id: BufferId, _t: &str| {

@@ -176,6 +176,17 @@ fn display_item_source_trait_exposes_items() {
 }
 
 #[test]
+fn display_source_mapped_text_remainder_preserves_face_name() {
+    let remainder = DisplaySourceMappedText::new("abc")
+        .with_face_name(Some("bold".to_owned()))
+        .into_remainder_after(1)
+        .expect("one-character remainder");
+
+    assert_eq!(remainder.text.as_ref(), "bc");
+    assert_eq!(remainder.face_name(), Some("bold"));
+}
+
+#[test]
 fn glyphless_method_routes_cf_format_control_to_zero_width() {
     let m = |c: char| glyphless_method_for_char(c, GlyphlessJoinerPolicy::ClassifyAsGlyphless);
     // GNU `format-control` group (Cf, except SHY): the interlinear annotation

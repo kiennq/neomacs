@@ -320,6 +320,24 @@ impl BufferSourceItemLayoutResolutionContext<'_> {
         item.face =
             RenderFaceRef::FaceId(render_face_ref_id(item.face, active_face_state.face_id()));
 
+        let display_table_face_name = match &item.kind {
+            DisplayItemKind::SourceMappedText(text) => text.face_name().map(str::to_owned),
+            _ => None,
+        };
+        let active_face_state = if let Some(face_name) = display_table_face_name.as_deref() {
+            self.merge_display_table_active_face(
+                source_render,
+                face_ids,
+                row_geometry,
+                active_face_state,
+                item,
+                face_name,
+            )
+            .unwrap_or_else(|| active_face_state.clone())
+        } else {
+            active_face_state.clone()
+        };
+
         // GNU `merge_escape_glyph_face` (xdisp.c:8372-8389): a control char shown
         // as `^A` paints in the `escape-glyph` face merged over the surrounding
         // base face. Realize that merged face here, install it, and use it as the
@@ -331,7 +349,7 @@ impl BufferSourceItemLayoutResolutionContext<'_> {
                 source_render,
                 face_ids,
                 row_geometry,
-                active_face_state,
+                &active_face_state,
                 item,
                 "escape-glyph",
             )
@@ -355,7 +373,7 @@ impl BufferSourceItemLayoutResolutionContext<'_> {
                 source_render,
                 face_ids,
                 row_geometry,
-                active_face_state,
+                &active_face_state,
                 item,
                 face_name,
             )
@@ -398,13 +416,27 @@ impl BufferSourceItemLayoutResolutionContext<'_> {
         resolved_active_face
     }
 
-    /// Realize a face = the surrounding base (active) face merged with the named
-    /// face (GNU `merge_faces (w, <face>, 0, base_face_id)`), install it under a
-    /// fresh id, set the item to that face, and return it as the active-face
-    /// state. Returns `None` when the merge changes nothing (no themed
-    /// foreground), so plain terminals keep the surrounding face exactly like
-    /// GNU's no-op merge. Shared by the escape-glyph (control char) and
-    /// nobreak-space/nobreak-hyphen (nbsp/hyphen) hooks.
+    /// Realize a display-table face merged over the active face, retaining all
+    /// named-face attributes. Returns `None` when the full merge is unchanged.
+    fn merge_display_table_active_face(
+        &self,
+        source_render: &mut TextRowSourceRenderState<'_>,
+        face_ids: &mut FrameFaceAttempt,
+        row_geometry: &mut DisplayRowGeometryState,
+        active_face_state: &DisplayRowActiveFaceState,
+        item: &mut DisplayItem,
+        face_name: &str,
+    ) -> Option<DisplayRowActiveFaceState> {
+        let base = active_face_state.resolved_face();
+        let merged = source_render.merge_named_face_over(base, face_name);
+        if merged == *base {
+            return None;
+        }
+        Some(self.install_merged_active_face(source_render, face_ids, row_geometry, item, merged))
+    }
+
+    /// Realize the legacy escape/nobreak face merge. Its foreground-only
+    /// no-op rule is intentional and keeps those paths unchanged.
     fn merge_named_active_face(
         &self,
         source_render: &mut TextRowSourceRenderState<'_>,
@@ -419,6 +451,17 @@ impl BufferSourceItemLayoutResolutionContext<'_> {
         if merged.fg == base.fg && merged.use_default_foreground == base.use_default_foreground {
             return None;
         }
+        Some(self.install_merged_active_face(source_render, face_ids, row_geometry, item, merged))
+    }
+
+    fn install_merged_active_face(
+        &self,
+        source_render: &mut TextRowSourceRenderState<'_>,
+        face_ids: &mut FrameFaceAttempt,
+        row_geometry: &mut DisplayRowGeometryState,
+        item: &mut DisplayItem,
+        merged: ResolvedFace,
+    ) -> DisplayRowActiveFaceState {
         let face_id = stable_face_id_for_resolved(face_ids, &merged);
         item.face = RenderFaceRef::FaceId(face_id);
         let resolved_active_face = source_render.resolve_and_install_measured_face(
@@ -430,7 +473,7 @@ impl BufferSourceItemLayoutResolutionContext<'_> {
         );
         let metrics = resolved_active_face.metrics();
         row_geometry.include_row_extents(metrics.row_height(), metrics.ascent());
-        Some(resolved_active_face)
+        resolved_active_face
     }
 }
 
