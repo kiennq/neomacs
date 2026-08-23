@@ -3591,12 +3591,12 @@ impl Default for TaggedHeap {
 // — the companion to `NEOVM_GC_STRESS=1`, which is what makes a missing root
 // deterministic — or per-thread from a test.
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 thread_local! {
     static VERIFY_MARKED_OBJECTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn verify_marked_objects_enabled() -> bool {
     static FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let from_env =
@@ -3605,7 +3605,7 @@ fn verify_marked_objects_enabled() -> bool {
 }
 
 /// Turn post-mark ownership verification on for THIS thread.
-#[cfg(all(debug_assertions, test))]
+#[cfg(test)]
 pub(crate) fn set_verify_marked_objects_for_test(on: bool) {
     VERIFY_MARKED_OBJECTS.with(|flag| flag.set(on));
 }
@@ -6812,7 +6812,7 @@ impl TaggedHeap {
         // The mark has drained and the sweep has not started: the one moment
         // where "marked" and "owned" must agree. A marked object that no arena
         // or intrusive list owns is a root that pointed at freed memory.
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, test))]
         if verify_marked_objects_enabled() {
             let problems = self.verify_marked_objects_owned();
             assert_eq!(
@@ -9112,7 +9112,7 @@ impl TaggedHeap {
     /// `NEOVM_GC_VERIFY_MARKED=1` or a test turns it on: the walk is O(live
     /// objects) per collection. It was dead code with an `#[allow(dead_code)]`
     /// "delete or wire up" note until ledger 162 wired it up.
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     fn verify_marked_objects_owned(&self) -> usize {
         let mut problems = 0usize;
         // Build a set of all owned non-cons object addresses
