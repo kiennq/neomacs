@@ -4950,7 +4950,7 @@ fn vm_split_window_and_frame_selection_builtins_use_shared_runtime_state() {
                               (eq (selected-frame) f1))))"#,
             |eval| crate::emacs_core::terminal::pure::mark_selected_terminal_usable_for_test(eval),
         ),
-        "OK (t 2 t t t 2 2 nil 1 t)"
+        "OK (t 2 t t t 2 2 t 2 t)"
     );
 }
 

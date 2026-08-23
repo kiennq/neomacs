@@ -15390,7 +15390,8 @@ fn a_just_this_one_wait_notifies_another_childs_sentinel_like_gnu() {
 fn epipe_on_send_leaves_the_real_child_status_for_the_next_wait_to_reap() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::test_utils::runtime_startup_context();
-    let sh = find_bin("sh");
+    let sh =
+        crate::emacs_core::fileio::host_path_to_lisp_file_name_string(Path::new(&find_bin("sh")));
 
     let result = eval_one_in_context(
         &mut eval,

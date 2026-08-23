@@ -23,6 +23,7 @@ readonly -a build_packages=(
     m4
     libssl-dev
     fontconfig
+    fonts-noto-core
     libfontconfig1-dev
     libfreetype-dev
     libncurses-dev
@@ -81,7 +82,6 @@ case "$profile" in
             xdotool
             imagemagick
             weston
-            fonts-noto-core
         )
         required_commands=(gpg Xvfb xauth xdpyinfo xdotool import weston)
         requires_emacs=true

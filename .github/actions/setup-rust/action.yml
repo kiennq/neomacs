@@ -68,7 +68,6 @@ runs:
         cache-shared-key: ${{ inputs.cache-shared-key != '' && format('{0}-{1}', inputs.cache-shared-key, hashFiles('scripts/ci/setup-linux.sh', '.github/actions/setup-rust/action.yml')) || '' }}
         cache-workspace-crates: ${{ inputs.cache-workspace-crates }}
         cache-bin: false
-        cache-on-failure: true
         cache-save-if: ${{ inputs.cache-save-if }}
         # Preserve workspace/config rustflags; the upstream action otherwise
         # injects `-D warnings` globally and changes existing build behavior.

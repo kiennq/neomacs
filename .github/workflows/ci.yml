@@ -37,41 +37,25 @@ jobs:
       - name: Run actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
 
+      - name: Test release workflow contract
+        run: python scripts/test-release-workflow.py
+
       - name: Lint release shell contracts
         run: |
           shellcheck \
-            install.sh \
-            scripts/dispatch-release-event.sh \
-            scripts/generate-release-notes.sh \
-            scripts/prepare-docker-runtime-context.sh \
-            scripts/test-dispatch-release-event.sh \
-            scripts/test-docker-runtime-context.sh \
-            scripts/test-generate-release-notes.sh \
             scripts/check-native-font-boundaries.sh \
             scripts/lib/macos-macho.sh \
             scripts/vendor-macos-runtime.sh \
-            scripts/test-macos-dependency-closure.sh
-          sh -n install.sh
+            scripts/test-macos-dependency-closure.sh \
+            scripts/vendor-windows-gstreamer-runtime.sh \
+            scripts/windows-gstreamer-env.sh
           bash -n \
-            scripts/dispatch-release-event.sh \
-            scripts/generate-release-notes.sh \
-            scripts/prepare-docker-runtime-context.sh \
-            scripts/test-dispatch-release-event.sh \
-            scripts/test-docker-runtime-context.sh \
-            scripts/test-generate-release-notes.sh \
             scripts/check-native-font-boundaries.sh \
             scripts/lib/macos-macho.sh \
             scripts/vendor-macos-runtime.sh \
-            scripts/test-macos-dependency-closure.sh
-
-      - name: Test Docker runtime context contract
-        run: ./scripts/test-docker-runtime-context.sh
-
-      - name: Test release dispatch contract
-        run: ./scripts/test-dispatch-release-event.sh
-
-      - name: Test release-note generation contract
-        run: ./scripts/test-generate-release-notes.sh
+            scripts/test-macos-dependency-closure.sh \
+            scripts/vendor-windows-gstreamer-runtime.sh \
+            scripts/windows-gstreamer-env.sh
 
       - name: Check native font dependency boundaries
         run: ./scripts/check-native-font-boundaries.sh
@@ -84,23 +68,13 @@ jobs:
         run: ./scripts/test-macos-dependency-closure.sh
 
   fmt:
-    name: cargo fmt (${{ matrix.label }})
+    name: cargo fmt
     if: github.event_name != 'schedule'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            label: linux-x86_64
-          - runner: macos-latest
-            label: macos-aarch64
-          - runner: windows-latest
-            label: windows-msvc-x86_64
     steps:
       - *checkout
 
@@ -110,7 +84,7 @@ jobs:
           # cargo fmt does not compile: a build cache here is ~180 MiB per
           # platform for no reuse, against a shared 10 GiB repo limit.
           cache: "false"
-          cache-key: ci-fmt-${{ matrix.label }}
+          cache-key: ci-fmt
 
       - name: cargo fmt
         run: |
@@ -141,8 +115,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            label: linux-x86_64
           - runner: ubuntu-24.04-arm
             label: linux-aarch64
           - runner: macos-latest
@@ -154,6 +126,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      GSTREAMER_VERSION: 1.26.9
     steps:
       - *checkout
 
@@ -165,6 +138,34 @@ jobs:
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
         run: brew install pkg-config
+      - name: Restore GStreamer SDK cache
+        if: runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64'
+        id: cache-gstreamer
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v3
+
+      - name: Install and configure GStreamer SDK
+        if: runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64'
+        shell: pwsh
+        run: ./scripts/setup-windows-gstreamer.ps1 -Install
+
+      - name: Run Windows GStreamer setup contract
+        if: runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64'
+        shell: pwsh
+        run: ./scripts/test-windows-gstreamer-setup.ps1
+
+      - name: Save GStreamer SDK cache
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64' && steps.cache-gstreamer.outputs.cache-hit != 'true' && hashFiles('PFiles64/gstreamer/1.0/msvc_x86_64/bin/pkg-config.exe') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: ${{ steps.cache-gstreamer.outputs.cache-primary-key }}
 
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
@@ -172,11 +173,7 @@ jobs:
           cache-key: ci-check-${{ matrix.label }}
           cache-shared-key: ${{ matrix.label }}-dev
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-          install-nextest: ${{ matrix.label == 'linux-x86_64' || matrix.label == 'windows-msvc-x86_64' }}
-
-      - name: Check native dependency type coherence
-        if: matrix.label == 'linux-x86_64'
-        run: cargo run --locked -p xtask -- check-dependency-coherence
+          install-nextest: ${{ matrix.label == 'windows-msvc-x86_64' }}
 
       - name: cargo check workspace (Unix)
         if: runner.os != 'Windows'
@@ -186,6 +183,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          if [ "${{ matrix.label }}" = "windows-msvc-x86_64" ]; then
+            source scripts/windows-gstreamer-env.sh
+          fi
           cargo check --workspace --all-targets
 
       - name: Test DirectWrite native font replay
@@ -194,16 +194,6 @@ jobs:
         run: >-
           cargo nextest run -p neomacs-layout-engine
           font_backend::windows::tests
-
-      - name: cargo check minimal capability build
-        if: matrix.label == 'linux-x86_64'
-        run: cargo check -p neomacs --no-default-features
-
-      - name: Test SQLite-disabled capability surface
-        if: matrix.label == 'linux-x86_64'
-        run: >-
-          cargo nextest run -p neovm-core --no-default-features
-          -E 'test(disabled_build_exposes_only_gnu_capability_probes)'
 
   # Cross-compilation cannot exercise inotify, kqueue, or
   # ReadDirectoryChangesW.  Keep this independent from the workspace check so
@@ -347,6 +337,15 @@ jobs:
         with:
           cache: "false"
           cache-key: ci-no-gstreamer-linux-x86_64
+          install-nextest: true
+
+      - name: Check minimal capability build
+        run: cargo check -p neomacs --no-default-features
+
+      - name: Test SQLite-disabled capability surface
+        run: >-
+          cargo nextest run -p neovm-core --no-default-features
+          -E 'test(disabled_build_exposes_only_gnu_capability_probes)'
 
       - name: Build the minimal product without video
         run: cargo xtask fresh-build --release --minimal
@@ -368,7 +367,10 @@ jobs:
 
       - name: Smoke batch and real TUI in a GStreamer-free container
         run: |
-          docker run --rm --volume "$PWD:/workspace:ro" ubuntu:24.04 \
+          docker run --rm \
+            --env NEOMACS_RUNTIME_ROOT=/workspace \
+            --volume "$PWD:/workspace:ro" \
+            ubuntu:24.04 \
             bash -euxo pipefail -c "
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
@@ -378,45 +380,102 @@ jobs:
               TERM=xterm timeout 30s script -qec \"/workspace/target/release/neomacs -Q -nw --eval '(kill-emacs 0)'\" /dev/null
             "
 
-  neomacs-workspace-test-archive:
-    name: workspace test archive (linux x86_64)
+  neomacs-test-artifacts:
+    name: shared test artifacts (linux x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      # A release workspace test archive links several large test binaries.
-      # Bound compiler and linker parallelism to fit the hosted runner.
-      CARGO_BUILD_JOBS: "1"
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--threads=1"
       TMPDIR: ${{ github.workspace }}/tmp
     steps:
       - *checkout
       - &prepare_workspace_tmp
         name: Prepare workspace temp directory
         run: mkdir -p "$TMPDIR/nextest"
-      - *install_linux_deps
+      - name: Install Linux release dependencies
+        run: scripts/ci/setup-linux.sh release
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: ci-workspace-archive-linux-x86_64
+          cache-key: ci-test-artifacts-linux-x86_64
           cache-shared-key: linux-x86_64-release
+          cache-workspace-crates: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-nextest: true
+          target: x86_64-unknown-linux-gnu
 
-      - name: Build and archive workspace tests
+      - name: Check native dependency type coherence
+        run: cargo run --locked -p xtask -- check-dependency-coherence
+
+      - name: Compile release binaries
+        env:
+          NEOMACS_BUILD_PROFILE: release
+        run: >-
+          cargo build -p neomacs
+          --features video,neomacs-layout-engine/freetype-bundled
+          --profile release
+
+      - name: Bootstrap and dump
+        run: cargo xtask fresh-build --release --features neomacs-layout-engine/freetype-bundled --skip-build
+
+      - name: Run upstream GNU SQLite ERT suite
+        run: >-
+          target/release/neomacs
+          --batch -Q
+          -l test/src/sqlite-tests.el
+          -f ert-run-tests-batch-and-exit
+
+      - name: Run unchanged upstream GNU file-notify ERT suite
+        env:
+          REMOTE_TEMPORARY_FILE_DIRECTORY: /dev/null
         run: |
-          cargo nextest archive \
-            --release \
-            --workspace \
-            --archive-file neomacs-workspace-tests.tar.zst
+          mkdir -p "$PWD/target/file-notify-ert-tmp"
+          TMPDIR="$PWD/target/file-notify-ert-tmp" \
+            target/release/neomacs --batch -Q \
+              -l test/lisp/filenotify-tests.el \
+              -f ert-run-tests-batch-and-exit
+
+      # NEOVM_GC_STRESS collects at every allocation-bearing safe point, making
+      # missing roots deterministic instead of intermittent.
+      - name: GC-stress the shipped runtime
+        run: cargo xtask gc-stress
+
+      - name: Package shared test runtime
+        run: |
+          test -x target/release/neomacs
+          test -f target/release/neomacs.pdump
+          test -f lisp/international/charscript.el
+          test -f lisp/international/charprop.el
+          test -d etc/charsets
+          tar czf neomacs-test-runtime-linux-x86_64.tar.gz \
+            target/release/neomacs \
+            target/release/neomacs.pdump \
+            lisp \
+            etc
+
+      - name: Archive workspace tests
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: >-
+          cargo nextest archive
+          --release
+          --workspace
+          --archive-file neomacs-workspace-tests.tar.zst
 
       - name: Upload workspace test archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: neomacs-workspace-tests-nextest-archive-linux-x86_64
           path: neomacs-workspace-tests.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload shared test runtime
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: neomacs-test-runtime-linux-x86_64
+          path: neomacs-test-runtime-linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -455,171 +514,79 @@ jobs:
           --success-output immediate
           --no-fail-fast
 
-  neovm-core-tests:
+  neomacs-sharded-tests:
+    name: ${{ matrix.suite }} tests shard ${{ matrix.partition }}/20 (linux x86_64)
     if: github.event_name != 'schedule'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
-    uses: ./.github/workflows/nextest-shards.yml
-    with:
-      suite: core
-
-  neomacs-test-runtime:
-    name: Packaged Neomacs Runtime (linux x86_64)
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: ${{ matrix.suite == 'oracle' && 120 || 60 }}
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      NEOVM_ORACLE_MODE: snapshot
+      NEOVM_BINARY_PATH: ${{ github.workspace }}/target/release/neomacs
+      NEOMACS_TUI_NEOMACS_BIN: ${{ github.workspace }}/target/release/neomacs
+      NEOMACS_RUNTIME_ROOT: ${{ github.workspace }}
       TMPDIR: ${{ github.workspace }}/tmp
+      NEXTEST_FILTER: ${{ matrix.filter }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [core, oracle, tui]
+        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        include:
+          - suite: core
+            linux_profile: build
+            filter: package(neovm-core)
+          - suite: oracle
+            linux_profile: oracle
+            filter: package(neovm-oracle-tests)
+          - suite: tui
+            linux_profile: oracle
+            filter: package(neomacs-tui-tests)
     steps:
       - *checkout
       - *prepare_workspace_tmp
-      - *install_linux_deps
+
+      - name: Install suite dependencies
+        run: scripts/ci/setup-linux.sh "${{ matrix.linux_profile }}"
+
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: ci-shared-runtime-linux-x86_64
-          cache-shared-key: linux-x86_64-release
+          # Shards only run prebuilt binaries from the downloaded archive.
+          cache: "false"
+          cache-key: ci-${{ matrix.suite }}-shards
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-nextest: true
 
-      - name: Build fresh release runtime
-        run: cargo xtask fresh-build --release
-
-      - name: Run upstream GNU SQLite ERT suite
-        run: >-
-          target/release/neomacs
-          --batch -Q
-          -l test/src/sqlite-tests.el
-          -f ert-run-tests-batch-and-exit
-
-      - name: Run unchanged upstream GNU file-notify ERT suite
-        env:
-          REMOTE_TEMPORARY_FILE_DIRECTORY: /dev/null
+      - name: Configure libfaketime for oracle tests
+        if: matrix.suite == 'oracle'
         run: |
-          mkdir -p "$PWD/target/file-notify-ert-tmp"
-          TMPDIR="$PWD/target/file-notify-ert-tmp" \
-            target/release/neomacs --batch -Q \
-              -l test/lisp/filenotify-tests.el \
-              -f ert-run-tests-batch-and-exit
+          libfaketime_so="$(dpkg -L libfaketime | grep -E '/libfaketime\.so\.1$' | head -n 1)"
+          test -n "$libfaketime_so"
+          echo "NEOVM_LIBFAKETIME_SO=$libfaketime_so" >> "$GITHUB_ENV"
 
-      # The standing detector for the missing-GC-root class (DIVERGENCES.md
-      # 161/162). This collector is precise, so a Lisp value that rides Rust
-      # control flow is invisible to trace_roots unless it was rooted
-      # deliberately -- and such a bug is invisible to an ordinary green suite:
-      # the whole 38k-pin oracle suite was green on BOTH sides of 161's
-      # use-after-free. NEOVM_GC_STRESS=1 collects at every allocation-bearing
-      # safe point, which turns "sometimes" into "always".
-      - name: GC-stress the shipped runtime
-        run: cargo xtask gc-stress
-
-      # Exercise install.sh end-to-end against a release-shaped tree built
-      # from THIS commit (file:// download base), so the curl|bash path --
-      # download, checksum, versioned install, symlink chain, runtime-root
-      # resolution with no environment variables -- is proven before any
-      # release publishes it.
-      #
-      # BOTH tarball shapes are staged, because install.sh has a branch for
-      # each and a release that only exercises one of them ships the other
-      # untested: the current layout, whose dump sits in the archlib
-      # (libexec/neomacs/<version>/<triple>, GNU's archlibdir), and the
-      # pre-0.0.16 layout, whose dump sits in bin/ -- which --tag still has to
-      # be able to install.
-      - name: Verify install.sh against a staged release tree
-        run: |
-          set -eux
-          triple=x86_64-unknown-linux-gnu
-          crate_version="$(
-            awk '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0}
-                 s && /^version[[:space:]]*=/{gsub(/^version[[:space:]]*=[[:space:]]*"/,"");gsub(/".*$/,"");print;exit}' \
-              Cargo.toml
-          )"
-          archlib="libexec/neomacs/$crate_version/$triple"
-
-          stage_release() {
-            local version="$1" layout="$2"
-            local stage_root="$TMPDIR/install-release-$layout"
-            local staged="$stage_root/v$version"
-            local pkg_parent="$stage_root/pkg"
-            local pkg="$pkg_parent/neomacs-$version-$triple"
-            rm -rf "$stage_root"
-            mkdir -p "$staged" "$pkg/bin" "$pkg/share/neomacs"
-            cp target/release/neomacs target/release/neomacsclient "$pkg/bin/"
-            if [ "$layout" = archlib ]; then
-              mkdir -p "$pkg/$archlib"
-              cp target/release/neomacs.pdump "$pkg/$archlib/neomacs.pdump"
-            else
-              cp target/release/neomacs.pdump "$pkg/bin/neomacs.pdump"
-            fi
-            cp -r lisp etc "$pkg/share/neomacs/"
-            tar czf "$staged/neomacs-$version-$triple.tar.gz" \
-              -C "$pkg_parent" "neomacs-$version-$triple"
-            ( cd "$staged" && sha256sum "neomacs-$version-$triple.tar.gz" > SHA256SUMS )
-            local prefix="$stage_root/prefix"
-            NEOMACS_DOWNLOAD_BASE="file://$stage_root" \
-              sh install.sh --tag "v$version" --prefix "$prefix"
-            test -x "$prefix/bin/neomacs"
-            test "$(readlink "$prefix/share/neomacs/current")" = "versions/$version"
-            test "$(readlink "$prefix/bin/neomacs")" = "../share/neomacs/current/bin/neomacs"
-            local exe ver_dir
-            exe="$(readlink -f "$prefix/bin/neomacs")"
-            ver_dir="$(dirname "$(dirname "$exe")")"
-            if [ "$layout" = archlib ]; then
-              test -f "$ver_dir/$archlib/neomacs.pdump"
-              test ! -f "$(dirname "$exe")/neomacs.pdump"
-              # exec-directory is PATH_EXEC (GNU src/callproc.c:1961), so the
-              # installed tree has to answer with its own archlib.
-              env -u NEOMACS_RUNTIME_ROOT -u EMACSPATH \
-                "$prefix/bin/neomacs" --batch \
-                --eval "(princ exec-directory)" | grep -Fx "$ver_dir/$archlib/"
-            else
-              test -f "$(dirname "$exe")/neomacs.pdump"
-            fi
-            test -d "$ver_dir/share/neomacs/lisp"
-            env -u NEOMACS_RUNTIME_ROOT \
-              "$prefix/bin/neomacs" --batch --eval '(princ (emacs-version))'
-          }
-
-          stage_release citest archlib
-          stage_release citestlegacy legacy
-
-      - name: Package shared test runtime
-        run: |
-          test -x target/release/neomacs
-          test -f target/release/neomacs.pdump
-          test -f lisp/international/charscript.el
-          test -f lisp/international/charprop.el
-          test -d etc/charsets
-          tar czf neomacs-test-runtime-linux-x86_64.tar.gz \
-            target/release/neomacs \
-            target/release/neomacs.pdump \
-            lisp \
-            etc
-
-      - name: Upload shared test runtime
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
         with:
-          name: neomacs-test-runtime-linux-x86_64
-          path: neomacs-test-runtime-linux-x86_64.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          runtime: "true"
+          archive: "true"
 
-  neovm-oracle-tests:
-    if: github.event_name != 'schedule'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
-    uses: ./.github/workflows/nextest-shards.yml
-    with:
-      suite: oracle
-
-  neomacs-tui-tests:
-    if: github.event_name != 'schedule'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
-    uses: ./.github/workflows/nextest-shards.yml
-    with:
-      suite: tui
+      - name: Run nextest shard
+        run: |
+          cargo nextest run \
+            --archive-file neomacs-workspace-tests.tar.zst \
+            --extract-to "$TMPDIR/nextest" \
+            -E "$NEXTEST_FILTER" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --partition slice:${{ matrix.partition }}/20 \
+            --no-fail-fast
 
   neomacs-melpa-tests:
     name: MELPA ${{ matrix.suite }} compatibility and GNU parity (linux x86_64)
     if: github.event_name != 'schedule'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -660,27 +627,11 @@ jobs:
           cache: "false"
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-nextest: true
-      - &download_test_runtime
-        name: Download shared test runtime
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
         with:
-          name: neomacs-test-runtime-linux-x86_64
-          path: .
-
-      - &unpack_test_runtime
-        name: Unpack shared test runtime
-        run: |
-          tar xzf neomacs-test-runtime-linux-x86_64.tar.gz
-          chmod +x target/release/neomacs
-          test -f lisp/international/charscript.el
-          test -f lisp/international/charprop.el
-
-      - &download_workspace_test_archive
-        name: Download workspace test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: neomacs-workspace-tests-nextest-archive-linux-x86_64
-          path: .
+          runtime: "true"
+          archive: "true"
 
       - name: Install Nix for exact MELPA test runtimes
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
@@ -706,7 +657,7 @@ jobs:
   neomacs-display-tests:
     name: display stack tests (linux x86_64)
     if: github.event_name != 'schedule'
-    needs: neomacs-workspace-test-archive
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -730,7 +681,10 @@ jobs:
           cache: "false"
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-nextest: true
-      - *download_workspace_test_archive
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
+        with:
+          archive: "true"
 
       - name: Run display stack tests
         run: |
@@ -744,7 +698,7 @@ jobs:
   neomacs-prefix-face-tui-parity:
     name: GNU prefix face TUI parity (linux x86_64)
     if: github.event_name != 'schedule'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -765,9 +719,11 @@ jobs:
           cache: "false"
           cache-key: ci-prefix-face-tui-parity
           install-nextest: true
-      - *download_test_runtime
-      - *unpack_test_runtime
-      - *download_workspace_test_archive
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
+        with:
+          runtime: "true"
+          archive: "true"
 
       - name: Compare buffer-remapped prefix faces with GNU Emacs
         env:
@@ -789,7 +745,7 @@ jobs:
   neomacs-gui-tests:
     name: real GUI tests (linux x86_64, X11)
     if: github.event_name != 'schedule'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -816,9 +772,11 @@ jobs:
           cache: "false"
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-nextest: true
-      - *download_test_runtime
-      - *unpack_test_runtime
-      - *download_workspace_test_archive
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
+        with:
+          runtime: "true"
+          archive: "true"
 
       - name: Run real GUI tests
         run: |
@@ -841,7 +799,7 @@ jobs:
   neomacs-melpa-live-canary:
     name: MELPA live ecosystem canary (linux x86_64)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [neomacs-test-runtime, neomacs-workspace-test-archive]
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -868,9 +826,11 @@ jobs:
           cache: "false"
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-nextest: true
-      - *download_test_runtime
-      - *unpack_test_runtime
-      - *download_workspace_test_archive
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
+        with:
+          runtime: "true"
+          archive: "true"
 
       - name: Run current MELPA ecosystem canary
         run: |
@@ -886,7 +846,7 @@ jobs:
   doom-install-compatibility:
     name: doom install compatibility (linux x86_64)
     if: github.event_name != 'schedule'
-    needs: neomacs-test-runtime
+    needs: neomacs-test-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -897,8 +857,10 @@ jobs:
       - *checkout
       - *prepare_workspace_tmp
       - *install_linux_deps
-      - *download_test_runtime
-      - *unpack_test_runtime
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
+        with:
+          runtime: "true"
 
       - name: Install unmodified Doom with Neomacs
         run: ./scripts/test-doom-install.sh

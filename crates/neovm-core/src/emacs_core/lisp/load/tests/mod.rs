@@ -9842,8 +9842,8 @@ fn nested_load_restores_parent_load_file_name() {
     let loaded = load_file(&mut eval, &parent).expect("load parent fixture");
     assert_eq!(loaded, Value::T);
 
-    let parent_str = parent.to_string_lossy().to_string();
-    let child_str = child.to_string_lossy().to_string();
+    let parent_str = crate::emacs_core::fileio::host_path_to_lisp_file_name_string(&parent);
+    let child_str = crate::emacs_core::fileio::host_path_to_lisp_file_name_string(&child);
     assert_eq!(
         eval.obarray()
             .symbol_value("vm-parent-seen")
@@ -9907,8 +9907,8 @@ fn nested_load_exact_gc_preserves_reader_load_file_name() {
         "exact GC should have run during nested load"
     );
 
-    let parent_str = parent.to_string_lossy().to_string();
-    let child_str = child.to_string_lossy().to_string();
+    let parent_str = crate::emacs_core::fileio::host_path_to_lisp_file_name_string(&parent);
+    let child_str = crate::emacs_core::fileio::host_path_to_lisp_file_name_string(&child);
     assert_eq!(
         eval.obarray()
             .symbol_value("vm-parent-reader-before")

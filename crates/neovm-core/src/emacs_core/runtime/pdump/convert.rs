@@ -5086,13 +5086,8 @@ pub(crate) fn load_obarray(
     decoder: &mut LoadDecoder,
     dob: &DumpObarray,
 ) -> Result<Obarray, DumpError> {
-    // Duplicate-slot detection is a property of the WRITER (each obarray
-    // symbol is serialized once); like the object-extra completeness pass it
-    // can only catch a dumper bug and a duplicate cannot corrupt memory --
-    // from_dump just overwrites the slot. Debug builds (where every
-    // round-trip test runs) keep the check; release trusts the dump.
-    // Measured ~4M Ir across the dedup sets on a 17.6K-symbol load.
-    #[cfg(debug_assertions)]
+    // Duplicate-slot detection must run before Obarray::from_dump, which
+    // assumes each serialized symbol slot is unique.
     let mut seen_symbol_ids = FxHashSet::default();
     // Collect (sym_id, dump_data) for a second pass over Localized symbols.
     let mut localized_entries: Vec<(SymId, &DumpSymbolData)> = Vec::new();
@@ -5103,7 +5098,6 @@ pub(crate) fn load_obarray(
     let mut symbols = Vec::with_capacity(dob.symbols.len());
     for (id, sd) in &dob.symbols {
         let sym_id = load_sym_id(id);
-        #[cfg(debug_assertions)]
         if !seen_symbol_ids.insert(sym_id) {
             return Err(DumpError::DeserializationError(format!(
                 "pdump obarray is inconsistent: duplicate symbol slot {}",
@@ -5162,7 +5156,6 @@ pub(crate) fn load_obarray(
             let plist = unsafe { row.add(3).read_unaligned() };
 
             let sym_id = load_sym_id(&DumpSymId(dump_id));
-            #[cfg(debug_assertions)]
             if !seen_symbol_ids.insert(sym_id) {
                 return Err(DumpError::DeserializationError(format!(
                     "pdump obarray is inconsistent: duplicate symbol row {}",
@@ -5198,11 +5191,6 @@ pub(crate) fn load_obarray(
         }
     }
 
-    #[cfg(not(debug_assertions))]
-    let load_member_set = |_label: &str, ids: &[DumpSymId]| -> Result<Vec<SymId>, DumpError> {
-        Ok(ids.iter().map(load_sym_id).collect())
-    };
-    #[cfg(debug_assertions)]
     let load_member_set = |label: &str, ids: &[DumpSymId]| -> Result<Vec<SymId>, DumpError> {
         let mut seen = FxHashSet::default();
         let mut loaded = Vec::with_capacity(ids.len());

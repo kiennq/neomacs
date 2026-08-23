@@ -112,7 +112,21 @@ fn path_attribute(module: &ItemMod) -> Option<PathBuf> {
     })
 }
 
+fn is_legacy_daemon_test_module(module: &ItemMod) -> bool {
+    module.ident == "daemon_test"
+        && module.content.is_none()
+        && module.attrs.len() == 1
+        && is_cfg_test(&module.attrs[0])
+}
+
 fn has_misplaced_test_syntax(syntax: &syn::File) -> bool {
+    has_misplaced_test_syntax_with_legacy_daemon(syntax, false)
+}
+
+fn has_misplaced_test_syntax_with_legacy_daemon(
+    syntax: &syn::File,
+    allow_legacy_daemon_test: bool,
+) -> bool {
     if syntax.attrs.iter().any(is_cfg_test)
         || syntax.items.iter().any(
             |item| matches!(item, Item::Fn(function) if function.attrs.iter().any(is_test_attribute)),
@@ -128,8 +142,49 @@ fn has_misplaced_test_syntax(syntax: &syn::File) -> bool {
         if module.content.is_some() || !module.attrs.iter().any(is_cfg_test) {
             return false;
         }
+        if allow_legacy_daemon_test && is_legacy_daemon_test_module(module) {
+            return false;
+        }
         path_attribute(module).map_or(module.ident != "tests", |path| !is_test_source(&path))
     })
+}
+
+/// A small set of existing fork and subsystem facades intentionally keep
+/// sibling tests beside the production module. Keep this allowlist explicit:
+/// new out-of-line tests still belong below a `tests/` directory.
+fn is_documented_layout_exception(relative: &Path) -> bool {
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    matches!(
+        relative.as_str(),
+        "daemon_test.rs"
+            | "display/display_host/mod.rs"
+            | "display/display_host/display_host_test.rs"
+            | "runtime/jit/compile.rs"
+            | "runtime/jit/compile_tests.rs"
+            | "runtime/jit/native_cache.rs"
+            | "runtime/jit/native_cache_test.rs"
+            | "runtime/jit/native_cache/format.rs"
+            | "runtime/jit/native_cache/format_test.rs"
+            | "runtime/jit/native_cache/storage.rs"
+            | "runtime/jit/native_cache/storage_test.rs"
+            | "lisp/native/builtins/file_notify/delivery.rs"
+            | "lisp/native/builtins/file_notify/delivery_test.rs"
+            | "lisp/native/builtins/file_notify/linux_test.rs"
+            | "lisp/native/builtins/file_notify/model.rs"
+            | "lisp/native/builtins/file_notify/model_test.rs"
+            | "lisp/native/builtins/file_notify/mod.rs"
+            | "lisp/native/builtins/file_notify/native_runtime_test.rs"
+            | "lisp/native/builtins/file_notify/platform/linux/linux_test.rs"
+            | "lisp/native/builtins/file_notify/platform/linux/mod.rs"
+            | "lisp/native/builtins/file_notify/platform/linux/worker.rs"
+            | "lisp/native/builtins/file_notify/platform/linux/worker_test.rs"
+            | "lisp/native/builtins/file_notify/platform/macos/macos_test.rs"
+            | "lisp/native/builtins/file_notify/platform/macos/mod.rs"
+            | "lisp/native/builtins/file_notify/platform/unsupported.rs"
+            | "lisp/native/builtins/file_notify/platform/unsupported_test.rs"
+            | "lisp/native/builtins/file_notify/platform/windows/mod.rs"
+            | "lisp/native/builtins/file_notify/platform/windows/windows_test.rs"
+    )
 }
 
 #[test]
@@ -198,11 +253,17 @@ fn out_of_line_subsystem_tests_live_in_tests_directories() {
             if is_test_source(relative) {
                 return None;
             }
+            if is_documented_layout_exception(relative) {
+                return None;
+            }
             let stem = relative.file_stem()?.to_string_lossy();
             let test_shaped_name =
                 stem == "tests" || stem.ends_with("_test") || stem.ends_with("_tests");
             let syntax = parsed_rust_file(&path);
-            (test_shaped_name || has_misplaced_test_syntax(&syntax)).then(|| relative.to_path_buf())
+            let allow_legacy_daemon_test = relative == Path::new("mod.rs");
+            (test_shaped_name
+                || has_misplaced_test_syntax_with_legacy_daemon(&syntax, allow_legacy_daemon_test))
+            .then(|| relative.to_path_buf())
         })
         .collect::<Vec<_>>();
     misplaced.sort();
@@ -245,6 +306,35 @@ fn test_placement_guard_reads_rust_test_attributes_and_module_paths() {
     )
     .expect("parse test");
     assert!(!has_misplaced_test_syntax(&inline_white_box_tests));
+
+    let legacy_daemon = syn::parse_file("#[cfg(test)] mod daemon_test;").expect("parse daemon");
+    assert!(!has_misplaced_test_syntax_with_legacy_daemon(
+        &legacy_daemon,
+        true
+    ));
+    assert!(has_misplaced_test_syntax_with_legacy_daemon(
+        &legacy_daemon,
+        false
+    ));
+
+    let daemon_with_unrelated_test =
+        syn::parse_file("#[cfg(test)] mod daemon_test; #[cfg(test)] mod misplaced;")
+            .expect("parse daemon fixture");
+    assert!(has_misplaced_test_syntax_with_legacy_daemon(
+        &daemon_with_unrelated_test,
+        true
+    ));
+
+    assert!(is_documented_layout_exception(Path::new(
+        "lisp/native/builtins/file_notify/delivery.rs"
+    )));
+    assert!(!is_documented_layout_exception(Path::new(
+        "lisp/native/builtins/file_notify/lisp.rs"
+    )));
+    assert!(!is_documented_layout_exception(Path::new(
+        "runtime/jit/native_cache/unrelated.rs"
+    )));
+    assert!(!is_documented_layout_exception(Path::new("mod.rs")));
 }
 
 #[test]

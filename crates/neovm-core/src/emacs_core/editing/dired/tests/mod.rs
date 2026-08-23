@@ -711,7 +711,8 @@ fn test_file_name_completion_regexps_fold_when_completion_ignore_case() {
         vec![Value::string(""), Value::string(&dir_str), Value::NIL],
     )
     .unwrap();
-    assert_eq!(result.as_utf8_str(), Some("con"));
+    // GNU preserves the first matching candidate's case here (`CON`).
+    assert_eq!(result.as_utf8_str(), Some("CON"));
 
     let _ = fs::remove_dir_all(&dir);
 }

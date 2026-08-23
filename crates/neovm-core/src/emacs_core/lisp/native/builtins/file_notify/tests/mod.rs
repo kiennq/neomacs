@@ -14,6 +14,32 @@ fn workspace_temp_dir() -> tempfile::TempDir {
 }
 
 #[test]
+fn file_notify_io_error_detail_matches_gnu_strerror() {
+    let detail = std::io::Error::from_raw_os_error(2).to_string();
+    #[cfg(target_os = "linux")]
+    let expected = "No such file or directory".to_owned();
+    #[cfg(not(target_os = "linux"))]
+    let expected = detail
+        .strip_suffix(" (os error 2)")
+        .unwrap_or(&detail)
+        .to_owned();
+    let flow = file_notify_error(
+        "Could not add watch for file",
+        Some(detail),
+        Some(Value::string("/tmp/missing")),
+    );
+    let crate::emacs_core::error::Flow::Signal(signal) = flow else {
+        panic!("expected a file-notify-error signal");
+    };
+    assert_eq!(
+        signal.data[1]
+            .as_utf8_str()
+            .expect("error detail should be a string"),
+        expected
+    );
+}
+
+#[test]
 fn compiled_file_notification_subrs_match_the_target_backend() {
     let names: Vec<_> = SUBRS.specs().iter().map(|spec| spec.name()).collect();
     #[cfg(target_os = "linux")]

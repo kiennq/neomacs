@@ -5990,6 +5990,7 @@ fn decode_insert_file_contents(
     // called the file DOS.
     let coding =
         match coding_system_for_read.filter(|coding| !coding.is_empty() && *coding != "nil") {
+            Some("prefer-utf-8") if has_utf8_signature(bytes) => "utf-8-with-signature".to_string(),
             Some(coding) => coding.to_string(),
             // A bare test context does not load the Lisp BOM recognizer used by
             // `set-auto-coding-function`; keep the same observable fallback.
@@ -6457,7 +6458,6 @@ pub(crate) fn builtin_insert_file_contents(
     };
     let contents = decode_insert_file_contents(eval, slice, multibyte, decision.coding_system())?;
     let decoded_char_count = contents.char_count();
-
     let signal_change_hooks = !visit || replace_requested;
     let hide_visited_file_name_during_replace = visit
         && replace_requested
@@ -6480,7 +6480,34 @@ pub(crate) fn builtin_insert_file_contents(
 
     // GNU `insert-file-contents' sets `last-coding-system-used' before
     // `after-insert-file-set-coding' derives `buffer-file-coding-system'.
-    eval.set_variable("last-coding-system-used", Value::symbol(&contents.coding));
+    let reported_coding = match &decision {
+        ReadCodingDecision::FileNameAlist(name) if name == "prefer-utf-8" => {
+            let base = contents
+                .coding
+                .strip_suffix("-unix")
+                .or_else(|| contents.coding.strip_suffix("-dos"))
+                .or_else(|| contents.coding.strip_suffix("-mac"))
+                .unwrap_or(&contents.coding);
+            let ascii_or_utf8 = matches!(
+                base,
+                "ascii" | "us-ascii" | "undecided" | "prefer-utf-8" | "utf-8"
+            );
+            if ascii_or_utf8 {
+                let eol = match crate::encoding::coding_name_eol(&contents.coding) {
+                    crate::emacs_core::coding::EolType::Unix => Some("unix"),
+                    crate::emacs_core::coding::EolType::Dos => Some("dos"),
+                    crate::emacs_core::coding::EolType::Mac => Some("mac"),
+                    crate::emacs_core::coding::EolType::Undecided => None,
+                };
+                eol.map(|eol| format!("prefer-utf-8-{eol}"))
+                    .unwrap_or_else(|| name.clone())
+            } else {
+                contents.coding.clone()
+            }
+        }
+        _ => contents.coding.clone(),
+    };
+    eval.set_variable("last-coding-system-used", Value::symbol(&reported_coding));
 
     let inserted_char_count = run_after_insert_file_pipeline(
         eval,

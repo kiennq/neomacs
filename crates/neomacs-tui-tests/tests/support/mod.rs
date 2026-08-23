@@ -15,6 +15,37 @@ const SETTLE_IDLE: Duration = Duration::from_millis(500);
 /// Granularity for interleaved poll of both PTYs during parallel boot.
 const POLL_SLICE: Duration = Duration::from_millis(80);
 
+/// Return startup diagnostics when an editor misses the scratch predicate.
+pub fn startup_readiness_failure_message(
+    editor: &str,
+    ready: bool,
+    grid: &[String],
+    recent_output: &[u8],
+) -> Option<String> {
+    if ready {
+        return None;
+    }
+
+    Some(format!(
+        "{editor} did not reach the scratch startup predicate before its deadline.\n\
+         Grid:\n{}\n\
+         Recent PTY output:\n{}",
+        grid.join("\n"),
+        String::from_utf8_lossy(recent_output),
+    ))
+}
+
+fn panic_if_startup_missed(editor: &str, ready: bool, session: &TuiSession) {
+    if let Some(message) = startup_readiness_failure_message(
+        editor,
+        ready,
+        &session.text_grid(),
+        session.recent_output(),
+    ) {
+        panic!("{message}");
+    }
+}
+
 // ── boot_pair (canonical) ──────────────────────────────────────────────
 
 /// Boot GNU Emacs and Neomacs side-by-side.
@@ -46,13 +77,6 @@ pub fn boot_pair_with_erase_char(
     let mut gnu = TuiSession::gnu_emacs_with_erase_char(extra_args, erase);
     let mut neo = TuiSession::neomacs_with_erase_char(extra_args, erase);
 
-    let startup_ready = |grid: &[String]| {
-        grid.iter().any(|row| row.contains("*scratch*"))
-            && grid
-                .iter()
-                .any(|row| row.contains("This buffer is for text that is not saved"))
-    };
-
     // Phase 1 — interleaved concurrent poll
     let gnu_deadline = Instant::now() + GNU_STARTUP_TIMEOUT;
     let neo_deadline = Instant::now() + NEO_STARTUP_TIMEOUT;
@@ -61,18 +85,21 @@ pub fn boot_pair_with_erase_char(
 
     while !gnu_ready || !neo_ready {
         let now = Instant::now();
-        if now >= gnu_deadline && now >= neo_deadline {
-            break;
+        if !gnu_ready && now >= gnu_deadline {
+            panic_if_startup_missed("GNU", gnu_ready, &gnu);
+        }
+        if !neo_ready && now >= neo_deadline {
+            panic_if_startup_missed("Neomacs", neo_ready, &neo);
         }
         if !gnu_ready && now < gnu_deadline {
             let cap = gnu_deadline.saturating_duration_since(now).min(POLL_SLICE);
             gnu.read(cap);
-            gnu_ready = startup_ready(&gnu.text_grid());
+            gnu_ready = scratch_ready(&gnu.text_grid());
         }
         if !neo_ready && now < neo_deadline {
             let cap = neo_deadline.saturating_duration_since(now).min(POLL_SLICE);
             neo.read(cap);
-            neo_ready = startup_ready(&neo.text_grid());
+            neo_ready = scratch_ready(&neo.text_grid());
         }
     }
     // Phase 2 — parallel settle (absorbs late-render bursts)
@@ -460,12 +487,9 @@ fn assert_pair_display_report(
     panic!("{label} violated exact TUI display parity");
 }
 
-/// Predicate: the `*scratch*` buffer is visible with its default content.
+/// Predicate: the `*scratch*` buffer is visible, regardless of its contents.
 pub fn scratch_ready(grid: &[String]) -> bool {
     grid.iter().any(|row| row.contains("*scratch*"))
-        && grid
-            .iter()
-            .any(|row| row.contains("This buffer is for text that is not saved"))
 }
 
 /// Dump both editor grids and their diffs to stderr for debugging.

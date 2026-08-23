@@ -961,6 +961,57 @@ fn recursive_edit_without_input_receiver_still_runs_noninteractive_top_level() {
 }
 
 #[test]
+fn nested_recursive_edit_treats_greater_than_top_level_depth_as_active_for_exit() {
+    crate::test_utils::init_test_tracing();
+    let (mut ev, global_map) = command_loop_error_test_context();
+    let (_tx, rx) = crossbeam_channel::unbounded();
+    ev.input_rx = Some(rx);
+    // The outermost command loop is already active.  This recursive edit
+    // increments raw depth from one to two, which is the first GNU-recursive
+    // level that may catch `exit`.
+    ev.command_loop.recursive_depth = 1;
+
+    ev.eval_str(
+        r#"(progn
+             (setq neo-after-recursive-exit-ran nil)
+             (fset 'neo-after-recursive-exit
+                   (lambda ()
+                     (interactive)
+                     (setq neo-after-recursive-exit-ran t)
+                     (neo-stop-command-loop-error-test))))"#,
+    )
+    .expect("install recursive-edit regression commands");
+
+    crate::emacs_core::keymap::list_keymap_define_seq(
+        global_map,
+        &[Value::fixnum('q' as i64)],
+        Value::symbol("exit-recursive-edit"),
+    )
+    .expect("define recursive-edit exit command");
+    crate::emacs_core::keymap::list_keymap_define_seq(
+        global_map,
+        &[Value::fixnum('s' as i64)],
+        Value::symbol("neo-after-recursive-exit"),
+    )
+    .expect("define post-exit sentinel command");
+    ev.command_loop.unread_event(Value::fixnum('q' as i64));
+    ev.command_loop.unread_event(Value::fixnum('s' as i64));
+    ev.command_loop.running = true;
+
+    let result = ev
+        .recursive_edit_inner()
+        .expect("exit-recursive-edit should unwind the recursive loop");
+    assert_eq!(result, Value::NIL);
+    assert_eq!(
+        ev.eval_symbol("neo-after-recursive-exit-ran")
+            .expect("read post-exit sentinel"),
+        Value::NIL,
+        "commands after exit-recursive-edit must not run"
+    );
+    assert_eq!(ev.command_loop.recursive_depth, 1);
+}
+
+#[test]
 fn outer_command_loop_leaves_exit_unmatched_inside_keyboard_macro() {
     crate::test_utils::init_test_tracing();
 
@@ -2394,6 +2445,10 @@ fn redisplay_syncs_opening_gui_frame_size_from_display_host() {
 fn recursive_edit_runs_top_level_before_outer_command_loop_reads_input() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
+    // This fixture models a live command loop. `Context::new()` is
+    // noninteractive by default, where GNU's unhandled command-error reporter
+    // turns the fallback WindowClose -> Quit into shutdown -1.
+    ev.set_variable("noninteractive", Value::NIL);
     let _ = ev.eval_str_each("(setq top-level '(setq neo-top-level-hit t))");
 
     let (tx, rx) = crossbeam_channel::unbounded();
