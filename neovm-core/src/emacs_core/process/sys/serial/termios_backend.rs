@@ -46,7 +46,11 @@ pub fn open(path: &OsStr) -> io::Result<Device> {
     // src/sysdep.c:2985-2987): a port that does not support it is still usable.
     // SAFETY: `TIOCEXCL` takes no pointer argument.
     unsafe {
-        libc::ioctl(fd.as_raw_fd(), libc::TIOCEXCL, 0 as libc::c_int);
+        libc::ioctl(
+            fd.as_raw_fd(),
+            libc::TIOCEXCL as _,
+            0 as libc::c_int,
+        );
     }
     Ok(Device { fd })
 }
