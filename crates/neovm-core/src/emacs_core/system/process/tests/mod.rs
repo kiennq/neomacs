@@ -2301,6 +2301,99 @@ fn stderr_pipe_wait_notifies_a_pending_owner_stop_first() {
     assert!(!owner.status_notify_pending);
 }
 
+#[test]
+fn deferred_stderr_notification_still_notifies_pending_owner_first() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    let stderr_id = eval.processes.create_process_with_kind(
+        "deferred-stderr".into(),
+        Value::NIL,
+        String::new(),
+        vec![],
+        ProcessKindWithoutDevice::Pipe,
+        ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    let owner_id = eval.processes.create_process(
+        "deferred-owner".into(),
+        Value::NIL,
+        "owner".into(),
+        vec![],
+        ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    {
+        let owner = eval.processes.get_mut(owner_id).expect("owner process");
+        owner.stderrproc = Value::make_process(stderr_id);
+        owner.status = process_status_run_value();
+        owner.pending_status = process_status_stop_value(19);
+        owner.status_notify_pending = true;
+        owner.sentinel = Value::NIL;
+    }
+    {
+        let stderr = eval.processes.get_mut(stderr_id).expect("stderr pipe");
+        stderr.status = process_status_run_value();
+        stderr.pending_status = process_status_exit_value(0);
+        stderr.status_notify_pending = true;
+        stderr.live_io.stderr_pipe_owner = Some(owner_id);
+    }
+    let request = ProcessOutputServiceRequest::target_only(stderr_id);
+    eval.poll_process_output_for_service_request(&request)
+        .expect("deferred status service pass");
+
+    assert!(
+        !eval
+            .processes
+            .get(owner_id)
+            .expect("owner remains live")
+            .status_notify_pending,
+        "the deferred stderr pass must preserve owner-first ordering"
+    );
+    assert!(
+        eval.processes
+            .get(stderr_id)
+            .expect("stderr remains live")
+            .status_notify_pending,
+        "the stderr notification must remain pending after the owner wins"
+    );
+}
+
+#[test]
+fn deferred_terminal_status_without_child_is_published_in_service_pass() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    let id = eval.processes.create_process_with_kind(
+        "deferred-terminal".into(),
+        Value::NIL,
+        String::new(),
+        vec![],
+        ProcessKindWithoutDevice::Pipe,
+        ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    let (reader, _writer) = os_pipe::pipe().expect("deferred terminal pipe");
+    {
+        let process = eval.processes.get_mut(id).expect("deferred process");
+        process.live_io.child_stdout = Some(ChildOutputReader::Shared(reader));
+        process.status = process_status_run_value();
+        process.pending_status = process_status_exit_value(0);
+        process.status_notify_pending = true;
+    }
+
+    let request = ProcessOutputServiceRequest::target_only(id);
+    eval.poll_process_output_for_service_request(&request)
+        .expect("deferred status service pass");
+
+    assert!(
+        eval.processes.get(id).is_none(),
+        "terminal deferred notification must retire the process"
+    );
+    let process = eval
+        .processes
+        .get_any(id)
+        .expect("retired process keeps its Lisp-visible state");
+    assert_eq!(process.status, process_status_exit_value(0));
+    assert_eq!(process.pending_status, Value::NIL);
+    assert!(!process.status_notify_pending);
+    assert!(process.live_io.child_stdout.is_none());
+}
 #[cfg(windows)]
 #[test]
 fn module_pipe_service_polling_is_nonblocking_before_write_and_services_data() {
@@ -4680,10 +4773,19 @@ fn serial_configuration_validates_option_domains() {
 #[test]
 fn serial_process_configure_resolves_buffer_and_port_designators() {
     crate::test_utils::init_test_tracing();
+    // `/dev/ptmx` allocates a fresh PTY pair for every serial process.  GNU's
+    // serial_open applies best-effort TIOCEXCL, so sharing one slave path
+    // would make the second constructor fail with EBUSY and would test
+    // exclusivity rather than designator resolution.
+    //
+    // Linux PTYs reject a later CS7-without-parity transition with EINVAL,
+    // although the same CS7 setting is accepted when parity is applied in
+    // the same termios update.  Keep the fixture's bytesize assertion while
+    // making that update valid on the PTY device.
     let result = eval_one(
         r#"(let ((by-port (make-serial-process
-                           :port "/dev/ptmx"
-                           :speed 9600))
+                          :port "/dev/ptmx"
+                          :speed 9600))
                  (by-buffer (make-serial-process
                              :port "/dev/ptmx"
                              :name "neo-serial-by-buffer-process"
@@ -4691,9 +4793,10 @@ fn serial_process_configure_resolves_buffer_and_port_designators() {
                              :speed 9600)))
              (unwind-protect
                  (progn
-                   (serial-process-configure
-                    :port "/dev/ptmx"
-                    :bytesize 7)
+                      (serial-process-configure
+                       :port "/dev/ptmx"
+                       :bytesize 7
+                       :parity 'even)
                    (serial-process-configure
                     :buffer "neo-serial-by-buffer"
                     :parity 'even)
@@ -15390,7 +15493,8 @@ fn a_just_this_one_wait_notifies_another_childs_sentinel_like_gnu() {
 fn epipe_on_send_leaves_the_real_child_status_for_the_next_wait_to_reap() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::test_utils::runtime_startup_context();
-    let sh = find_bin("sh");
+    let sh =
+        crate::emacs_core::fileio::host_path_to_lisp_file_name_string(Path::new(&find_bin("sh")));
 
     let result = eval_one_in_context(
         &mut eval,

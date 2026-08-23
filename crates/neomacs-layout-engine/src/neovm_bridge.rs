@@ -4691,18 +4691,19 @@ impl FaceResolver {
             return BufferBasicFaceLookup::Canonical(face_id);
         }
 
-        let face_name = face_id.name();
-        let has_direct_mapping = Self::buffer_face_remapping_specs(remapping, face_name).is_some();
-        let inherits = self
-            .face_table
-            .get(face_name)
-            .and_then(|face| face.inherit)
-            .is_some_and(|inherit| !inherit.is_nil() && !inherit.is_symbol_named("unspecified"));
-
-        // This is GNU `lookup_basic_face`'s fast path: an unrelated, non-nil
-        // remapping alist cannot change a basic face that neither has a direct
-        // mapping nor inherits from another face.
-        if !has_direct_mapping && !inherits {
+        // GNU `lookup_basic_face` keeps the fixed basic-face slot unless this
+        // face or one of its inherited named faces has an applicable remapping.
+        let mut remap_stack = Vec::new();
+        let mut remap_applied = false;
+        self.resolve_buffer_face_value_overlay_spec_inner(
+            remapping,
+            &Value::symbol(face_id.name()),
+            &mut remap_stack,
+            &mut remap_applied,
+            0,
+            FaceReferenceDiagnostics::Suppress,
+        );
+        if !remap_applied {
             BufferBasicFaceLookup::Canonical(face_id)
         } else {
             BufferBasicFaceLookup::WindowNamedOverFrameDefault(face_id)
@@ -4753,6 +4754,7 @@ impl FaceResolver {
         remapping: BufferFaceRemapping,
         name: &str,
         remap_stack: &mut Vec<String>,
+        remap_applied: &mut bool,
         depth: usize,
         diagnostics: FaceReferenceDiagnostics,
     ) -> Option<NeoFace> {
@@ -4770,11 +4772,13 @@ impl FaceResolver {
                 remapping,
                 &specs,
                 remap_stack,
+                remap_applied,
                 depth + 1,
                 FaceReferenceDiagnostics::Suppress,
             );
             remap_stack.pop();
             if remapped.is_some() {
+                *remap_applied = true;
                 return remapped;
             }
         }
@@ -4802,6 +4806,7 @@ impl FaceResolver {
                 remapping,
                 &inherit_ref,
                 remap_stack,
+                remap_applied,
                 depth + 1,
                 FaceReferenceDiagnostics::Suppress,
             )
@@ -4817,6 +4822,7 @@ impl FaceResolver {
         remapping: BufferFaceRemapping,
         val: &Value,
         remap_stack: &mut Vec<String>,
+        remap_applied: &mut bool,
         depth: usize,
         diagnostics: FaceReferenceDiagnostics,
     ) -> Option<NeoFace> {
@@ -4834,6 +4840,7 @@ impl FaceResolver {
                     remapping,
                     name,
                     remap_stack,
+                    remap_applied,
                     depth + 1,
                     diagnostics,
                 )
@@ -4850,6 +4857,7 @@ impl FaceResolver {
                             remapping,
                             &Value::list(filtered_spec),
                             remap_stack,
+                            remap_applied,
                             depth + 1,
                             diagnostics,
                         );
@@ -4866,6 +4874,7 @@ impl FaceResolver {
                             remapping,
                             &inherit_ref,
                             remap_stack,
+                            remap_applied,
                             depth + 1,
                             diagnostics,
                         )
@@ -4882,6 +4891,7 @@ impl FaceResolver {
                         remapping,
                         item,
                         remap_stack,
+                        remap_applied,
                         depth + 1,
                         diagnostics,
                     ));
@@ -4908,10 +4918,12 @@ impl FaceResolver {
         val: &Value,
     ) -> Option<ResolvedFace> {
         let mut remap_stack = Vec::new();
+        let mut remap_applied = false;
         self.resolve_buffer_face_value_overlay_spec_inner(
             remapping,
             val,
             &mut remap_stack,
+            &mut remap_applied,
             0,
             FaceReferenceDiagnostics::Report,
         )
@@ -4963,12 +4975,14 @@ impl FaceResolver {
         sources: &OrderedFaceSources,
     ) -> Option<ResolvedFace> {
         let mut remap_stack = Vec::new();
+        let mut remap_applied = false;
         let mut composition = UnresolvedFaceComposition::default();
         for value in sources.values() {
             composition.merge_optional(self.resolve_buffer_face_value_overlay_spec_inner(
                 remapping,
                 &value,
                 &mut remap_stack,
+                &mut remap_applied,
                 0,
                 FaceReferenceDiagnostics::Report,
             ));
@@ -4988,10 +5002,12 @@ impl FaceResolver {
         remapping: BufferFaceRemapping,
     ) -> ResolvedFace {
         let mut remap_stack = Vec::new();
+        let mut remap_applied = false;
         self.resolve_buffer_face_value_overlay_spec_inner(
             remapping,
             &Value::symbol("default"),
             &mut remap_stack,
+            &mut remap_applied,
             0,
             FaceReferenceDiagnostics::Report,
         )

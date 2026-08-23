@@ -6,6 +6,7 @@
 //! stop anyone rebuilding.  Synthetic dumps carry a real `struct dump_header`
 //! prefix, so they travel the same code path the real one does.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,59 @@ fn pinned_fingerprint() -> [u8; FINGERPRINT_LEN] {
         *byte = index as u8;
     }
     bytes
+}
+
+#[test]
+fn uninstalled_gnu_environment_detects_a_complete_extracted_layout() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let executable = root.path().join("src/emacs");
+    fs::create_dir_all(executable.parent().expect("src parent")).expect("create src");
+    fs::write(&executable, b"emacs").expect("write executable");
+    for directory in ["lisp", "etc", "lib-src", "info"] {
+        fs::create_dir(root.path().join(directory)).expect("create extracted sibling");
+    }
+
+    assert_eq!(
+        uninstalled_gnu_environment(&executable),
+        vec![
+            (
+                OsString::from("EMACSDATA"),
+                root.path().join("etc").into_os_string()
+            ),
+            (
+                OsString::from("EMACSDOC"),
+                root.path().join("etc").into_os_string()
+            ),
+            (
+                OsString::from("EMACSPATH"),
+                root.path().join("lib-src").into_os_string()
+            ),
+            (
+                OsString::from("EMACSLOADPATH"),
+                root.path().join("lisp").into_os_string()
+            ),
+            (
+                OsString::from("INFOPATH"),
+                root.path().join("info").into_os_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn uninstalled_gnu_environment_ignores_incomplete_or_installed_layouts() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let installed = root.path().join("emacs");
+    fs::write(&installed, b"installed emacs").expect("write installed executable");
+    assert!(uninstalled_gnu_environment(&installed).is_empty());
+
+    let extracted = root.path().join("src/emacs");
+    fs::create_dir_all(extracted.parent().expect("src parent")).expect("create src");
+    fs::write(&extracted, b"extracted emacs").expect("write extracted executable");
+    for directory in ["lisp", "etc"] {
+        fs::create_dir(root.path().join(directory)).expect("create extracted sibling");
+    }
+    assert!(uninstalled_gnu_environment(&extracted).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -424,11 +478,13 @@ fn a_missing_key_is_named() {
 // over the same planted fixtures the Rust one sees and require them to reach
 // the same verdict --- and, when they pass, to print the same stamp.
 
+#[cfg(unix)]
 fn attestor_script() -> PathBuf {
     Path::new(env!("CARGO_WORKSPACE_DIR")).join("scripts/parity-reference-attest.sh")
 }
 
 /// Write `manifest` to a file the shell attestor can read, comments and all.
+#[cfg(unix)]
 fn write_manifest(dir: &Path, manifest: &ReferenceManifest) -> PathBuf {
     let path = dir.join("parity-reference.toml");
     fs::write(
@@ -444,6 +500,7 @@ fn write_manifest(dir: &Path, manifest: &ReferenceManifest) -> PathBuf {
 }
 
 /// What the shell attestor said: exit status and its single stdout line.
+#[cfg(unix)]
 fn shell_attest(executable: &Path, depth: AttestationDepth, manifest: &Path) -> (i32, String) {
     let output = std::process::Command::new("bash")
         .arg(attestor_script())
@@ -462,6 +519,7 @@ fn shell_attest(executable: &Path, depth: AttestationDepth, manifest: &Path) -> 
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn both_readers_agree_on_a_matching_reference() {
     let fixture = Fixture::new(b"pinned emacs", pinned_fingerprint());
@@ -482,6 +540,7 @@ fn both_readers_agree_on_a_matching_reference() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn both_readers_refuse_the_same_planted_references() {
     let pinned = Fixture::new(b"pinned emacs", pinned_fingerprint());
@@ -540,6 +599,7 @@ fn both_readers_refuse_the_same_planted_references() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn both_readers_refuse_the_same_malformed_pins() {
     // The parsers are the part most likely to drift apart, and a parser that
@@ -589,6 +649,7 @@ fn both_readers_refuse_the_same_malformed_pins() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn both_readers_treat_the_opt_out_as_exact() {
     let fixture = Fixture::new(b"pinned emacs", pinned_fingerprint());
@@ -642,6 +703,7 @@ fn both_readers_treat_the_opt_out_as_exact() {
 // cost an hour to exercise thirty lines of shell.
 
 /// A stand-in for `neomacs --version` reporting `revision`.
+#[cfg(unix)]
 fn port_stub(dir: &Path, name: &str, revision: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(
@@ -657,6 +719,7 @@ fn port_stub(dir: &Path, name: &str, revision: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn port_attest(binary: &Path) -> (i32, String) {
     let output = std::process::Command::new("bash")
         .arg(attestor_script())
@@ -670,6 +733,7 @@ fn port_attest(binary: &Path) -> (i32, String) {
     )
 }
 
+#[cfg(unix)]
 fn head_revision() -> String {
     let output = std::process::Command::new("git")
         .arg("-C")

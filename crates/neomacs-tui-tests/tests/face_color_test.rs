@@ -73,6 +73,7 @@ fn wait_for_doom_startup(
 }
 
 #[test]
+#[ignore = "requires a Doom checkout under HOME"]
 fn index_org_has_face_colours() {
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME should be set"));
     let index = [

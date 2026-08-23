@@ -46,6 +46,39 @@ use recording::{RecordingIdentity, RecordingPolicy, SessionRecording, TerminalSi
 pub const COLS: u16 = 160;
 pub const ROWS: u16 = 50;
 
+/// Resolve and attest the GNU oracle together with any environment required by
+/// an extracted, uninstalled reference tree.
+pub fn gnu_emacs_program() -> (OsString, Vec<(OsString, OsString)>) {
+    let requested = [
+        "NEOVM_FORCE_ORACLE_PATH",
+        "NEOMACS_MELPA_ORACLE_EMACS",
+        "NEOVM_ORACLE_EMACS",
+        "ORACLE_EMACS",
+    ]
+    .into_iter()
+    .find_map(std::env::var_os)
+    .unwrap_or_else(|| OsString::from("emacs"));
+
+    match neomacs_parity_reference::attest(
+        Path::new(&requested),
+        neomacs_parity_reference::AttestationDepth::Fingerprint,
+    ) {
+        Ok(reference) => {
+            let executable = reference.executable().as_os_str().to_owned();
+            let environment =
+                neomacs_parity_reference::uninstalled_gnu_environment(reference.executable());
+            (executable, environment)
+        }
+        Err(neomacs_parity_reference::AttestationError::ExecutableUnresolved { .. }) => {
+            (requested, Vec::new())
+        }
+        Err(error) => panic!(
+            "the GNU TUI oracle is present but is NOT the pinned reference; \
+             refusing to compare against it\n{error}"
+        ),
+    }
+}
+
 /// One `--eval` argv element that silences GNU's async native-comp chatter
 /// (jit compilation, warning reports, and any compiler subprocess) so the
 /// oracle screen stays focused on the behavior under test.
@@ -517,9 +550,13 @@ impl TuiSession {
         // Keep the GNU oracle focused on TUI behavior.  On NixOS the async
         // native compiler can fail after startup and pop *Warnings*, which
         // pollutes the rendered screen unrelated to the command under test.
-        let launch = TuiLaunch::new("emacs")
+        let (program, environment) = gnu_emacs_program();
+        let mut launch = TuiLaunch::new(program)
             .args(["-nw", "-Q", "-no-comp-spawn", QUIET_NATIVE_COMP_EVAL])
             .args(extra_args.split_whitespace());
+        for (name, value) in environment {
+            launch = launch.env(name, value);
+        }
         Self::spawn_launch_with_erase_char(launch, "GNU", erase)
     }
 
@@ -539,10 +576,12 @@ impl TuiSession {
         S: Into<OsString>,
     {
         let real_home = PathBuf::from(std::env::var("HOME").expect("HOME"));
-        let launch = TuiLaunch::new("emacs")
-            .arg("-nw")
-            .args(extra_args)
-            .env("HOME", real_home.as_os_str());
+        let (program, environment) = gnu_emacs_program();
+        let mut launch = TuiLaunch::new(program).arg("-nw").args(extra_args);
+        for (name, value) in environment {
+            launch = launch.env(name, value);
+        }
+        let launch = launch.env("HOME", real_home.as_os_str());
         Self::spawn_launch(launch, "GNU")
     }
 

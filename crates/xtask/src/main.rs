@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Instant;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use production_capabilities::ProductionVideoBackend;
 use production_capabilities::{CargoCapability, ProductionCapabilities};
 
@@ -592,27 +592,18 @@ impl FreshBuildOptions {
                 return Err(
                     "fresh-build must be used with --release or --profile NAME.\n\n\
                  fresh-build builds the runnable GNU-shaped runtime pipeline \
-                 (cargo build, temacs bootstrap, byte-compilation, pdump) and is an \
-                 optimized-build operation. Re-run with:\n    cargo xtask fresh-build --release\n\
-                 or, for a symbol-preserving profiling build that leaves target/release \
-                 alone:\n    cargo xtask fresh-build --profile profiling"
+                 (cargo build, temacs bootstrap, byte-compilation, pdump). Re-run with:\n\
+                     cargo xtask fresh-build --release\n\
+                 or choose any explicit Cargo profile, for example:\n\
+                     cargo xtask fresh-build --profile dev"
                         .to_string()
                         .into(),
                 );
             }
         };
-        // The pipeline byte-compiles the whole Lisp tree with the binary it
-        // just built; an unoptimized profile makes that take hours, which is
-        // what the original --release requirement existed to prevent.
-        if !profile.is_optimized() {
-            return Err(format!(
-                "fresh-build cannot use the `{}` profile: the pipeline \
-                 byte-compiles the Lisp tree with the binary it builds, so it \
-                 needs an optimized profile (`release`, or `profiling` which \
-                 inherits it).",
-                profile.as_name()
-            )
-            .into());
+
+        if matches!(profile, BuildProfile::Dev | BuildProfile::DevRelease) {
+            no_byte_compile = true;
         }
 
         let bin_dir = bin_dir.unwrap_or_else(|| default_bin_dir(&repo_root, &profile));
@@ -683,9 +674,8 @@ enum BuildProfile {
     ReleasePgoProfiling,
     /// The instrumented pass that PRODUCES a profile. Never a PGO consumer.
     ReleasePgoGen,
-    /// Unoptimized; rejected, since the pipeline byte-compiles the Lisp tree
-    /// with the binary it just built.
     Dev,
+    DevRelease,
     Debug,
     Test,
     #[strum(disabled)]
@@ -713,11 +703,6 @@ impl BuildProfile {
     /// string inequality, so the recursion is impossible rather than guarded.
     fn consumes_pgo(&self) -> bool {
         matches!(self, Self::ReleasePgo | Self::ReleasePgoProfiling)
-    }
-
-    /// Optimized enough to byte-compile the Lisp tree with.
-    fn is_optimized(&self) -> bool {
-        !matches!(self, Self::Dev | Self::Debug | Self::Test)
     }
 
     /// Directory name cargo writes this profile's artifacts into.
@@ -1093,6 +1078,20 @@ fn run_fresh_build_inner(
         &loaddefs_args,
         &envs,
     )?;
+
+    if !options.dry_run {
+        let mut generated_loaddefs = generated_secondary_loaddefs_files(&paths.lisp_root)?;
+        generated_loaddefs.extend([
+            loaddefs_el.clone(),
+            theme_loaddefs_el.clone(),
+            paths.lisp_root.join("emacs-lisp/cl-loaddefs.el"),
+        ]);
+        for path in generated_loaddefs {
+            if path.is_file() {
+                normalize_lisp_line_endings(&path)?;
+            }
+        }
+    }
 
     print_synthetic_step(&format!(
         "generate {} from {}",
@@ -3017,6 +3016,57 @@ fn remove_primary_loaddefs_for_regeneration(
     Ok(())
 }
 
+fn generated_secondary_loaddefs_files(lisp_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_secondary_loaddefs_files(lisp_root, lisp_root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_secondary_loaddefs_files(
+    lisp_root: &Path,
+    current: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = match fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_secondary_loaddefs_files(lisp_root, &path, out)?;
+        } else if is_generated_secondary_loaddefs_file(lisp_root, &path) {
+            out.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_generated_secondary_loaddefs_file(lisp_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(lisp_root) else {
+        return false;
+    };
+
+    if matches!(
+        relative,
+        rel if rel == Path::new("loaddefs.el")
+            || rel == Path::new("ldefs-boot.el")
+            || rel == Path::new("theme-loaddefs.el")
+            || rel == Path::new("emacs-lisp/cl-loaddefs.el")
+    ) {
+        return false;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    file_name == "loaddefs.el" || file_name.ends_with("-loaddefs.el")
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<bool> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -3709,7 +3759,11 @@ fn run_compile_main(
     }
 
     if !errors.is_empty() {
-        eprintln!("  ERROR  {} files failed to byte-compile:", errors.len());
+        eprintln!(
+            "  ERROR  {} compiler invocation{} failed:",
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" }
+        );
         for e in &errors {
             eprintln!("    - {}", e);
         }
@@ -3721,7 +3775,7 @@ fn run_compile_main(
 
 fn compile_main_failure_summary(errors: &[String]) -> String {
     format!(
-        "compile-main failed to byte-compile {} file{}",
+        "compile-main failed in {} compiler invocation{}",
         errors.len(),
         if errors.len() == 1 { "" } else { "s" }
     )
@@ -3828,21 +3882,24 @@ fn run_compile_main_parallel(
     let mut errors = Vec::new();
 
     for wave in waves {
+        let batches = compile_main_batches(options.native_comp, wave);
         let wave_errors = if options.dry_run {
-            wave.iter()
-                .filter_map(|source| {
-                    run_final_compile_main_source(options, paths, envs, source)
+            batches
+                .iter()
+                .filter_map(|sources| {
+                    run_final_compile_main_sources(options, paths, envs, sources)
                         .err()
-                        .map(|err| format!("{} ({err})", source.display()))
+                        .map(|err| format!("{} ({err})", compile_main_batch_label(sources)))
                 })
                 .collect::<Vec<_>>()
         } else {
             pool.install(|| {
-                wave.par_iter()
-                    .filter_map(|source| {
-                        run_final_compile_main_source(options, paths, envs, source)
+                batches
+                    .par_iter()
+                    .filter_map(|sources| {
+                        run_final_compile_main_sources(options, paths, envs, sources)
                             .err()
-                            .map(|err| format!("{} ({err})", source.display()))
+                            .map(|err| format!("{} ({err})", compile_main_batch_label(sources)))
                     })
                     .collect::<Vec<_>>()
             })
@@ -3854,6 +3911,30 @@ fn run_compile_main_parallel(
     Ok(errors)
 }
 
+// Compile-time requires mutate process-global Lisp state, so each source needs
+// the same fresh-process isolation as GNU's per-file Makefile rule.
+const COMPILE_MAIN_BATCH_SIZE: usize = 1;
+
+fn compile_main_batches(native_comp: bool, sources: Vec<PathBuf>) -> Vec<Vec<PathBuf>> {
+    let batch_size = if native_comp {
+        1
+    } else {
+        COMPILE_MAIN_BATCH_SIZE
+    };
+    sources
+        .chunks(batch_size)
+        .map(<[PathBuf]>::to_vec)
+        .collect()
+}
+
+fn compile_main_batch_label(sources: &[PathBuf]) -> String {
+    sources
+        .iter()
+        .map(|source| source.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn run_compile_main_serial(
     options: &FreshBuildOptions,
     paths: &PipelinePaths,
@@ -3863,7 +3944,7 @@ fn run_compile_main_serial(
     sources
         .iter()
         .filter_map(|source| {
-            run_final_compile_main_source(options, paths, envs, source)
+            run_final_compile_main_sources(options, paths, envs, std::slice::from_ref(source))
                 .err()
                 .map(|err| format!("{} ({err})", source.display()))
         })
@@ -4003,13 +4084,20 @@ fn run_preloaded_lisp_byte_compile_source(
     )
 }
 
-fn run_final_compile_main_source(
+fn run_final_compile_main_sources(
     options: &FreshBuildOptions,
     paths: &PipelinePaths,
     envs: &[(OsString, OsString)],
-    source: &Path,
+    sources: &[PathBuf],
 ) -> Result<()> {
-    run_byte_compile_source_with(options, compile_main_emacs(paths), envs, source)
+    let args = compile_main_args_for_sources(options.native_comp, sources);
+    run_command(
+        options,
+        &options.repo_root,
+        compile_main_emacs(paths),
+        &args,
+        envs,
+    )
 }
 
 fn run_byte_compile_source_with(
@@ -4018,7 +4106,7 @@ fn run_byte_compile_source_with(
     envs: &[(OsString, OsString)],
     source: &Path,
 ) -> Result<()> {
-    let args = compile_main_args_for_source(options.native_comp, source);
+    let args = compile_main_args_for_sources(options.native_comp, std::slice::from_ref(&source));
     run_command(options, &options.repo_root, program, &args, envs)
 }
 
@@ -4206,7 +4294,10 @@ fn compile_main_dependency_paths(fragment: &str, lisp_root: &Path) -> Vec<PathBu
         .collect()
 }
 
-fn compile_main_args_for_source(native_comp: bool, source: &Path) -> Vec<OsString> {
+fn compile_main_args_for_sources<T: AsRef<Path>>(
+    native_comp: bool,
+    sources: &[T],
+) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--batch"),
         OsString::from("--no-site-file"),
@@ -4225,7 +4316,11 @@ fn compile_main_args_for_source(native_comp: bool, source: &Path) -> Vec<OsStrin
         args.push(OsString::from("-f"));
         args.push(OsString::from("batch-byte-compile"));
     }
-    args.push(source.as_os_str().to_os_string());
+    args.extend(
+        sources
+            .iter()
+            .map(|source| source.as_ref().as_os_str().to_os_string()),
+    );
     args
 }
 
@@ -4497,6 +4592,14 @@ fn write_ldefs_boot(loaddefs_el: &Path, ldefs_boot: &Path) -> Result<()> {
     Ok(())
 }
 
+fn normalize_lisp_line_endings(path: &Path) -> Result<()> {
+    let contents = fs::read_to_string(path)?;
+    if contents.contains("\r\n") {
+        fs::write(path, contents.replace("\r\n", "\n"))?;
+    }
+    Ok(())
+}
+
 const LOADDEFS_END_BOUNDARY: &str = "\n\x0c\n;;; End of scraped data";
 // GNU Emacs 31.0.90's `loaddefs-generate` prints the autoload docstring on its
 // own line (verified against the system emacs-31.0.90 binary), not the older
@@ -4585,7 +4688,8 @@ unless it was rooted deliberately, and such a bug is invisible to an ordinary
 green suite (DIVERGENCES.md 161 and 162).
 
 --release (or --profile NAME) is required: fresh-build produces the runnable runtime
-binary by byte-compiling the Lisp tree with it, so it needs an optimized profile.
+pipeline. Any explicit Cargo profile is accepted. Dev skips Lisp
+byte-compilation for a faster inner loop.
 
 Build the GNU-shaped Neomacs runtime pipeline:
   1. cargo build --verbose -p neomacs with the selected product capabilities
@@ -4599,6 +4703,8 @@ Build the GNU-shaped Neomacs runtime pipeline:
   9. bootstrap-neomacs byte-compiles the GNU src/lisp.mk preloaded Lisp set
  10. neomacs-temacs --temacs=pdump
  11. neomacs byte-compiles the GNU compile-main Lisp set into .elc files
+
+ For dev builds, stages 5, 9, and 11 are skipped.
 
 Options:
   --bin-dir DIR       Directory containing neomacs and generated role copies
@@ -4631,8 +4737,9 @@ Options:
   --profile NAME      Build with cargo profile NAME, using target/<dir> for it.
                       `profiling` inherits release but keeps debug symbols, and
                       lives in target/profiling -- so it does NOT disturb an
-                      existing target/release build or its pdump. Unoptimized
-                      profiles (dev/debug/test) are rejected.
+                      existing target/release build or its pdump. Any explicit
+                      profile is accepted; dev skips Lisp byte-compilation for
+                      a faster inner loop.
   --dry-run           Print planned commands without running them
   --low-memory        Bound every Cargo compile to one job; slower, but avoids
                       the release-link OOM reported on 8 GiB WSL/Nix machines

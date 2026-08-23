@@ -400,6 +400,7 @@ fn editor_launch(
         .envs(packages.process_environment())
         .envs(display_env.set_entries())
         .env_remove("EMACSLOADPATH")
+        .envs(runtime.process_environment())
         .env("TERM", "screen-256color")
         .current_dir(sandbox.root());
     for key in display_env.removed_entries() {

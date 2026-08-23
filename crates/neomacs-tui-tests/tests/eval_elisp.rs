@@ -8487,13 +8487,13 @@ fn set_visited_file_name_elisp_functions_match_gnu_semantics() {
     );
 
     let ready = |grid: &[String]| {
+        // GNU marks terminal-wrapped echo-area rows with a trailing
+        // backslash.  Remove that continuation marker before joining rows so
+        // readiness does not depend on the incidental wrapping.
         let recent = grid
             .iter()
-            .rev()
-            .take(4)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|row| row.trim_end().trim_end_matches('\\'))
+            .collect::<String>();
         recent.contains("visfile:")
             && recent.contains(r#"(\"neo-vis\" nil nil"#)
             && recent.contains(&format!(r#"(\"{basename}\""#))

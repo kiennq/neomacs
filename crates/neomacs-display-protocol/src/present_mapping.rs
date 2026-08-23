@@ -215,6 +215,18 @@ impl PresentMapping {
         self.surface.logical_size()
     }
 
+    /// Whether the immutable presentation has caught up with the live
+    /// drawable surface. During a native resize, the surface can be larger or
+    /// smaller than the last committed frame; that stale mapping is useful for
+    /// pointer clipping, but must not be submitted as a new surface frame.
+    #[must_use]
+    pub fn content_matches_surface(self) -> bool {
+        let content = self.content_logical_size();
+        let surface = self.surface_logical_size();
+        content.width().round() == surface.width().round()
+            && content.height().round() == surface.height().round()
+    }
+
     #[must_use]
     pub const fn visible_content_rect(
         self,

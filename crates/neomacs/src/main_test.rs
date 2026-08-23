@@ -3,6 +3,8 @@ use super::frame_layout::{
     install_tty_redisplay_callback as maybe_install_tty_redisplay_callback,
 };
 use super::image_catalog::{AsyncImageCatalog, wait_for_image_metadata};
+#[cfg(windows)]
+use super::log_target_for;
 use super::tty_frontend::{TtyPopupDisplayHost, TtyTerminalHost};
 use super::tty_init::{
     default_controlling_tty_name, detect_tty_background_mode, should_enable_live_tty_io,
@@ -20,7 +22,10 @@ use super::{
     run_gnu_startup, runtime_mode_from_program_name, source_bootstrap_loadup_invocation,
     startup_dimensions, sync_live_gui_frame_titles, sync_selected_gui_chrome_state,
 };
-use neomacs_display_protocol::{SelectionOwner, VideoId, WebViewId};
+use neomacs_display_protocol::SelectionOwner;
+#[cfg(feature = "video")]
+use neomacs_display_protocol::VideoId;
+use neomacs_display_protocol::WebViewId;
 use neomacs_display_runtime::render_thread::{
     ImageDecodeTerminal, ImageRenderState, SharedImageRenderState,
 };
@@ -1659,6 +1664,19 @@ fn runtime_mode_binary_names_match_gnu_shaped_roles() {
 }
 
 #[test]
+#[cfg(windows)]
+fn windows_gui_logging_is_opt_in_with_rust_log() {
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, false),
+        neovm_core::logging::LogTarget::File
+    );
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, true),
+        neovm_core::logging::LogTarget::Stdout
+    );
+}
+
+#[test]
 fn runtime_mode_comes_from_invoked_program_name() {
     assert_eq!(
         runtime_mode_from_program_name("/tmp/neomacs-temacs"),
@@ -2948,8 +2966,8 @@ fn primary_display_host_request_video_queues_create_once_with_stable_id() {
     ));
 }
 
-#[test]
 #[cfg(feature = "video")]
+#[test]
 fn resolved_video_registry_never_evicts_a_still_referenceable_identity() {
     let mut registry = super::ResolvedVideoRegistry::default();
     for index in 0..80 {

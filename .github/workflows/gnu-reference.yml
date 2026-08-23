@@ -1,0 +1,102 @@
+name: gnu-reference
+
+on:
+  push:
+    tags:
+      - gnu-reference-0ee48ac4df2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gnu-reference-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: build and publish GNU reference
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install GNU build and GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            git \
+            ca-certificates \
+            autoconf \
+            automake \
+            texinfo \
+            pkg-config \
+            zstd \
+            libncurses-dev \
+            fontconfig \
+            fonts-noto-core \
+            libgtk-3-dev \
+            libjansson-dev \
+            libharfbuzz-dev \
+            libtree-sitter-dev \
+            libsqlite3-dev \
+            libxml2-dev \
+            libgnutls28-dev \
+            liblcms2-dev \
+            zlib1g-dev \
+            libgif-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libtiff-dev \
+            libxpm-dev \
+            libxft-dev \
+            libotf-dev \
+            xvfb \
+            xauth
+
+      - name: Build GNU reference asset
+        run: bash scripts/ci/build-gnu-reference.sh
+
+      - name: Create or update GNU reference release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          readonly release_tag="gnu-reference-0ee48ac4df2"
+          readonly asset="gnu-emacs-31.0.90-linux-x86_64.tar.zst"
+          readonly checksum="${asset}.sha256"
+
+          if ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            declare -a tag_target=(--target "$GITHUB_SHA")
+            if [[ $GITHUB_REF == "refs/tags/$release_tag" ]]; then
+              tag_target=(--verify-tag)
+            fi
+            gh release create "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              "${tag_target[@]}" \
+              --title "GNU Emacs 31.0.90 reference" \
+              --notes "CI-built durable GNU Emacs 31.0.90 parity reference."
+          fi
+
+          existing_assets="$(
+            gh release view "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          readonly existing_assets
+          for named_asset in "$asset" "$checksum"; do
+            if printf '%s\n' "$existing_assets" | grep -Fxq -- "$named_asset"; then
+              echo "refusing to replace immutable release asset '$named_asset' on '$release_tag'" >&2
+              exit 1
+            fi
+          done
+
+          gh release upload "$release_tag" "$asset" "$checksum" \
+            --repo "$GITHUB_REPOSITORY"

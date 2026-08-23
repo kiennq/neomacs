@@ -64,6 +64,7 @@
 //! `UNATTESTED`.  It cannot be reached by accident --- absent that variable, a
 //! reference that does not match is an [`AttestationError`], never a warning.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -308,6 +309,45 @@ pub fn manifest_path() -> PathBuf {
         return PathBuf::from(path);
     }
     Path::new(env!("CARGO_WORKSPACE_DIR")).join("parity-reference.toml")
+}
+
+/// Return the GNU-only environment needed by an uninstalled extracted tree.
+///
+/// GNU's uninstalled executable is laid out as `<root>/src/emacs`, with the
+/// data, documentation, helper programs, Lisp, and Info trees beside `src`. An
+/// installed GNU has its own compiled-in paths and must not receive these
+/// overrides, so incomplete or differently-shaped layouts return no entries.
+pub fn uninstalled_gnu_environment(executable: &Path) -> Vec<(OsString, OsString)> {
+    let Some(src) = executable.parent() else {
+        return Vec::new();
+    };
+    if executable.file_name() != Some(OsStr::new("emacs"))
+        || src.file_name() != Some(OsStr::new("src"))
+        || !executable.is_file()
+    {
+        return Vec::new();
+    }
+    let Some(root) = src.parent() else {
+        return Vec::new();
+    };
+    let data = root.join("etc");
+    let info = root.join("info");
+    let lib_src = root.join("lib-src");
+    let lisp = root.join("lisp");
+    if !data.is_dir() || !info.is_dir() || !lib_src.is_dir() || !lisp.is_dir() {
+        return Vec::new();
+    }
+
+    vec![
+        (OsString::from("EMACSDATA"), data.into_os_string()),
+        (
+            OsString::from("EMACSDOC"),
+            root.join("etc").into_os_string(),
+        ),
+        (OsString::from("EMACSPATH"), lib_src.into_os_string()),
+        (OsString::from("EMACSLOADPATH"), lisp.into_os_string()),
+        (OsString::from("INFOPATH"), info.into_os_string()),
+    ]
 }
 
 /// Read and parse the checked-in manifest.

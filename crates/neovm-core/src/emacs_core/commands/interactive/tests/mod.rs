@@ -4108,9 +4108,7 @@ K")
 #[test]
 fn interactive_lambda_extended_reader_prompt_codes_signal_eof_in_batch() {
     crate::test_utils::init_test_tracing();
-    let mut ev = gnu_simple_command_execute_eval();
-    let results = eval_all_with(
-        &mut ev,
+    let results = gnu_simple_command_execute_eval_all(
         r#"(list
              (condition-case err
                  (call-interactively (lambda (x) (interactive "aFunction: ") x))
@@ -4272,9 +4270,7 @@ fn interactive_lambda_m_s_x_x_and_z_specs_signal_eof_in_batch() {
 #[test]
 fn interactive_lambda_g_e_and_u_specs_follow_batch_behavior() {
     crate::test_utils::init_test_tracing();
-    let mut ev = gnu_simple_command_execute_eval();
-    let results = eval_all_with(
-        &mut ev,
+    let results = gnu_simple_command_execute_eval_all(
         r#"(list
              (condition-case err
                  (call-interactively (lambda (x) (interactive "GFind file: ") x))
@@ -5524,6 +5520,28 @@ fn where_is_internal_rebuilds_reverse_index_after_keymap_mutation() {
     );
 
     assert_eq!(results, ["OK ([97] [98])"]);
+    assert_eq!(eval.interactive.where_is_reverse_index_build_count(), 2);
+}
+
+#[test]
+fn where_is_reverse_index_reference_survives_cross_context_epoch_bump() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = eval_with_interactive_shims();
+    let keymaps = vec![make_list_keymap()];
+    let command = Value::symbol("cross-context-epoch-command");
+
+    let acquired_sequences = {
+        let index = ensure_where_is_reverse_index(&mut eval, &keymaps);
+        let sequences = index.sequences_for(command);
+        crate::emacs_core::keymap::note_keymap_mutation();
+        assert_eq!(index.sequences_for(command), sequences);
+        sequences
+    };
+
+    assert_eq!(acquired_sequences, Vec::<Vec<Value>>::new());
+    assert_eq!(eval.interactive.where_is_reverse_index_build_count(), 1);
+
+    let _rebuilt = ensure_where_is_reverse_index(&mut eval, &keymaps);
     assert_eq!(eval.interactive.where_is_reverse_index_build_count(), 2);
 }
 

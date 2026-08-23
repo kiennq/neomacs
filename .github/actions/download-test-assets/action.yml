@@ -1,0 +1,85 @@
+name: Download shared test assets
+description: Download and unpack the shared Linux x86_64 test artifacts.
+
+inputs:
+  runtime:
+    description: Download and unpack the shared test runtime.
+    required: false
+    default: "false"
+  archive:
+    description: Download the shared nextest archive.
+    required: false
+    default: "false"
+  gnu-reference:
+    description: Download and attest the pinned GNU Emacs reference.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Download shared test runtime
+      if: inputs.runtime == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: neomacs-test-runtime-linux-x86_64
+        path: .
+
+    - name: Unpack and validate shared test runtime
+      if: inputs.runtime == 'true'
+      shell: bash
+      run: |
+        tar xzf neomacs-test-runtime-linux-x86_64.tar.gz
+        chmod +x target/release/neomacs
+        test -x target/release/neomacs
+        test -f target/release/neomacs.pdump
+        test -f lisp/international/charscript.el
+        test -f lisp/international/charprop.el
+        test -d etc/charsets
+
+    - name: Download workspace test archive
+      if: inputs.archive == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: neomacs-workspace-tests-nextest-archive-linux-x86_64
+        path: .
+
+    - name: Download and attest GNU reference
+      if: inputs.gnu-reference == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        readonly gnu_reference_url="https://github.com/kiennq/neomacs/releases/download/gnu-reference-0ee48ac4df2/gnu-emacs-31.0.90-linux-x86_64.tar.zst"
+        readonly gnu_reference_checksum_url="${gnu_reference_url}.sha256"
+        readonly gnu_reference_archive="$RUNNER_TEMP/gnu-emacs-31.0.90-linux-x86_64.tar.zst"
+        readonly gnu_reference_checksum="$RUNNER_TEMP/gnu-emacs-31.0.90-linux-x86_64.tar.zst.sha256"
+        readonly gnu_reference_root="$GITHUB_WORKSPACE/gnu-reference"
+
+        curl --fail --location --retry 3 --retry-all-errors --retry-connrefused --show-error \
+          --output "$gnu_reference_archive" "$gnu_reference_url"
+        curl --fail --location --retry 3 --retry-all-errors --retry-connrefused --show-error \
+          --output "$gnu_reference_checksum" "$gnu_reference_checksum_url"
+        (
+          cd "$RUNNER_TEMP"
+          sha256sum -c "$(basename "$gnu_reference_checksum")"
+        )
+        rm -rf "$gnu_reference_root"
+        mkdir -p "$gnu_reference_root"
+        tar --zstd -xf "$gnu_reference_archive" -C "$gnu_reference_root"
+
+        chmod +x "$gnu_reference_root/src/emacs"
+        test -x "$gnu_reference_root/src/emacs"
+        test -f "$gnu_reference_root/src/emacs.pdmp"
+        for directory in lisp etc lib-src info; do
+          test -d "$gnu_reference_root/$directory"
+        done
+        scripts/parity-reference-attest.sh "$gnu_reference_root/src/emacs" exhaustive
+
+        echo "$gnu_reference_root/src" >> "$GITHUB_PATH"
+        for variable in \
+          "NEOMACS_MELPA_ORACLE_EMACS=$gnu_reference_root/src/emacs" \
+          "NEOVM_ORACLE_EMACS=$gnu_reference_root/src/emacs" \
+          "NEOVM_FORCE_ORACLE_PATH=$gnu_reference_root/src/emacs" \
+          "NEOMACS_GUI_TEST_GNU_EMACS=$gnu_reference_root/src/emacs"; do
+          echo "$variable" >> "$GITHUB_ENV"
+        done

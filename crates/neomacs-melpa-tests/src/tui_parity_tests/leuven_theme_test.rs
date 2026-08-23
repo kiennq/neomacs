@@ -115,7 +115,13 @@ const LEUVEN_TUI_PRELUDE: &str = r####"
               (goto-char (point-min))
               (special-mode)
               (switch-to-buffer (current-buffer))
-              (delete-other-windows))))))))
+              (delete-other-windows)))))))
+  ;; Let the startup hook return before advertising that the PTY can accept
+  ;; the next command.  The lifecycle buffer is visible before startup has
+  ;; handed control back to the command loop.
+  (run-at-time 0 nil
+               (lambda ()
+                 (message "LEUVEN-TUI-STARTUP-COMPLETE"))))
 
 (defun neomacs-leuven-tui-populate-buffers ()
   "Create and fontify the representative real editing buffers."
@@ -415,6 +421,9 @@ const REPORT_PREFIXES: &[&str] = &[
     "RUN ",
     "LEUVEN-TUI-READY",
 ];
+const STARTUP_COMPLETE_MARKER: &str = "LEUVEN-TUI-STARTUP-COMPLETE";
+const MX_INPUT_TIMEOUT: Duration = Duration::from_secs(8);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 
 fn lifecycle_report(pair: &PackageTuiPair, gnu: bool) -> String {
     let grid = if gnu {
@@ -447,15 +456,24 @@ fn invoke(session: &mut TuiSession, command: &str, ready: &str) {
     session.send_keys("M-x");
     wait_for(
         session,
-        Duration::from_secs(8),
+        MX_INPUT_TIMEOUT,
         &format!("M-x prompt before {command}"),
         |grid| grid.iter().any(|row| row.contains("M-x")),
     );
     session.send(command.as_bytes());
+    wait_for(
+        session,
+        MX_INPUT_TIMEOUT,
+        &format!("M-x command input {command:?}"),
+        |grid| {
+            grid.iter()
+                .any(|row| row.contains("M-x ") && row.contains(command))
+        },
+    );
     session.send_keys("RET");
     wait_for(
         session,
-        Duration::from_secs(12),
+        COMMAND_TIMEOUT,
         &format!("{command} readiness marker {ready:?}"),
         |grid| grid.iter().any(|row| row.contains(ready)),
     );
@@ -522,7 +540,10 @@ fn leuven_theme_real_color_lifecycle_matches_gnu() {
     let oracle = CachedMelpaOracle::new(LEUVEN_THEME_MELPA_PIN, "leuven-theme.el")
         .expect("prepare exact Leuven Theme source below ./tmp")
         .with_prelude(LEUVEN_TUI_PRELUDE);
-    let ready = |grid: &[String]| grid.iter().any(|row| row.contains("LEUVEN-TUI-READY"));
+    let ready = |grid: &[String]| {
+        grid.iter().any(|row| row.contains("LEUVEN-TUI-READY"))
+            && grid.iter().any(|row| row.contains(STARTUP_COMPLETE_MARKER))
+    };
     let mut pair = PackageTuiScenario::new("leuven-theme-lifecycle", oracle.prepared_packages())
         .spawn_when_ready(
             ReadinessCheckpoint::new(

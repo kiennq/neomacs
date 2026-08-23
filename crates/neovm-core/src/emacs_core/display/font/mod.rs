@@ -884,7 +884,9 @@ impl OpenedFont {
             Value::fixnum(m.height),
             Value::fixnum(0),
             Value::fixnum(0),
-            Value::fixnum(m.ascent),
+            // GNU leaves `default-ascent` unset; the actual ascent remains
+            // in the following ascent slot and in the stored metrics.
+            Value::fixnum(0),
             Value::fixnum(m.max_width),
             Value::fixnum(m.ascent),
             Value::fixnum(m.descent),
@@ -3179,7 +3181,6 @@ fn font_info_vector_for_runtime_font(
     let max_width = average_width;
     let ascent = ((height as f32) * 0.75).round() as i64;
     let descent = (height - ascent).max(0);
-    let default_ascent = ascent;
 
     Value::vector(vec![
         opened_name,
@@ -3188,7 +3189,8 @@ fn font_info_vector_for_runtime_font(
         Value::fixnum(height),
         Value::fixnum(0),
         Value::fixnum(0),
-        Value::fixnum(default_ascent),
+        // GNU leaves `default-ascent` unset; retain the actual ascent below.
+        Value::fixnum(0),
         Value::fixnum(max_width),
         Value::fixnum(ascent),
         Value::fixnum(descent),

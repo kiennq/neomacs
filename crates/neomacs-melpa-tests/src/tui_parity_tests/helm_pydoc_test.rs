@@ -131,6 +131,53 @@ fn filter_module(pair: &mut PackageTuiPair, module: &str) {
     });
 }
 
+const ACTION_MENU_NEEDLES: &[&str] = &[
+    "Pydoc Module",
+    "View Source Code",
+    "Import Module(import module)",
+    "Import Module(from module import identifiers)",
+    "Import Module(from module import identifiers as name)",
+];
+
+fn action_menu_raw_rows(
+    pair: &PackageTuiPair,
+) -> (Vec<RawTerminalSnapshot>, Vec<RawTerminalSnapshot>) {
+    let rows = matching_indices(&pair.gnu, ACTION_MENU_NEEDLES);
+    assert!(!rows.is_empty(), "Helm action menu did not render any rows");
+    let capture = |session: &TuiSession| {
+        rows.iter()
+            .map(|&row| RawTerminalSnapshot::capture_rows(session.screen(), row..row + 1))
+            .collect()
+    };
+    (capture(&pair.gnu), capture(&pair.neo))
+}
+
+fn wait_for_action_menu_raw_parity(pair: &mut PackageTuiPair) {
+    // Semantic menu markers can arrive before the final raw repaint.  Quiet
+    // snapshots alone can therefore stabilize on different terminal cells;
+    // require consecutive matching GNU/Neomacs snapshots instead.
+    // Three seconds bounds only this asynchronous menu transition; raw
+    // parity remains a hard assertion after the wait.
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    const QUIET_READ: Duration = Duration::from_millis(350);
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut matching_polls = 0;
+    while Instant::now() < deadline {
+        pair.gnu.read(QUIET_READ);
+        pair.neo.read(QUIET_READ);
+        let current = action_menu_raw_rows(pair);
+        if current.0 == current.1 {
+            matching_polls += 1;
+            if matching_polls == 2 {
+                return;
+            }
+        } else {
+            matching_polls = 0;
+        }
+    }
+}
+
 fn open_and_filter_module(pair: &mut PackageTuiPair, module: &str) {
     open_pydoc(pair);
     filter_module(pair, module);
@@ -139,12 +186,11 @@ fn open_and_filter_module(pair: &mut PackageTuiPair, module: &str) {
 fn open_action_menu(pair: &mut PackageTuiPair) {
     send_to_both(pair, |session| session.send_key("TAB"));
     wait_for_both(pair, Duration::from_secs(8), |grid| {
-        grid.iter().any(|row| row.contains("Pydoc Module"))
-            && grid.iter().any(|row| row.contains("View Source Code"))
-            && grid
-                .iter()
-                .any(|row| row.contains("Import Module(from module import identifiers as name)"))
+        ACTION_MENU_NEEDLES
+            .iter()
+            .all(|needle| grid.iter().any(|row| row.contains(needle)))
     });
+    wait_for_action_menu_raw_parity(pair);
 }
 
 fn matching_rows(session: &TuiSession, needles: &[&str]) -> String {
@@ -229,8 +275,11 @@ fn assert_stage(
         let gnu_snapshot = RawTerminalSnapshot::capture_rows(pair.gnu.screen(), row..row + 1);
         let neo_snapshot = RawTerminalSnapshot::capture_rows(pair.neo.screen(), row..row + 1);
         if gnu_snapshot != neo_snapshot {
+            let exact_differences = gnu_snapshot.exact_differences(&neo_snapshot);
             divergences.push(format!(
-                "{stage} raw terminal row {row} differs:\nGNU:\n{}Neomacs:\n{}",
+                "{stage} raw terminal row {row} differs:\n\
+                 Exact differences:\n{}\nGNU:\n{}Neomacs:\n{}",
+                exact_differences.join("\n"),
                 gnu_snapshot.plain_grid(),
                 neo_snapshot.plain_grid()
             ));

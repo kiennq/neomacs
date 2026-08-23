@@ -13,6 +13,20 @@ use crate::{
 
 const GUI_TIMEOUT: Duration = Duration::from_secs(180);
 const GUI_LOG_LIMIT: u64 = 1024 * 1024;
+// Neomacs under llvmpipe/Xvfb emits this exact environmental warning block.
+const NEOMACS_GUI_DIAGNOSTICS: [&str; 4] = [
+    "libEGL warning: DRI3 error: Could not get DRI3 device",
+    "libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering",
+    "MESA: info: vulkan: No DRI3 support detected - required for presentation",
+    "Note: you can probably enable DRI3 in your Xorg config",
+];
+// Preserve the only observed SGR decoration instead of stripping ANSI globally.
+const NEOMACS_GUI_DIAGNOSTICS_WITH_ANSI: [&str; 4] = [
+    NEOMACS_GUI_DIAGNOSTICS[0],
+    NEOMACS_GUI_DIAGNOSTICS[1],
+    "\x1b[4m\x1b[31mMESA: info: vulkan: No DRI3 support detected - required for presentation",
+    "Note: you can probably enable DRI3 in your Xorg config\x1b[0m",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GuiPairOutcome {
@@ -255,21 +269,36 @@ fn run_editor(
 }
 
 fn normalize_gui_stderr(stderr: String) -> Result<String, String> {
-    // GNU's GIO warning prefixes the same infrastructure condition with a
-    // process id and wall-clock timestamp. Preserve the exact condition while
-    // classifying only those two host-only fields. Every unrelated byte and
-    // line remains visible, including leading blank lines and diagnostics
-    // adjacent to the known warning.
+    // GNU may emit this GIO warning only when the host has no matching
+    // settings schema. It is environmental and optional, so remove the
+    // complete warning while preserving every unrelated byte and line,
+    // including leading blank lines and diagnostics adjacent to it.
     const MARKER: &str = "): GLib-GIO-CRITICAL **: ";
     const CONDITION: &str = "g_settings_schema_source_lookup: assertion 'source != NULL' failed";
-    const CANONICAL: &str =
-        "GLib-GIO-CRITICAL: g_settings_schema_source_lookup: assertion 'source != NULL' failed";
 
     let mut normalized = String::with_capacity(stderr.len());
+    let mut removed_known_warning = false;
+    let mut expected_neomacs_line = None;
     for segment in stderr.split_inclusive('\n') {
         let (line, newline) = segment
             .strip_suffix('\n')
             .map_or((segment, ""), |line| (line, "\n"));
+        if let Some(index) = known_neomacs_gui_diagnostic_index(line) {
+            let expected = expected_neomacs_line.unwrap_or(0);
+            if newline.is_empty() || index != expected {
+                return Err(format!("malformed Neomacs GUI diagnostic: {line:?}"));
+            }
+            if index + 1 == NEOMACS_GUI_DIAGNOSTICS.len() {
+                expected_neomacs_line = None;
+                removed_known_warning = true;
+            } else {
+                expected_neomacs_line = Some(index + 1);
+            }
+            continue;
+        }
+        if expected_neomacs_line.is_some() || resembles_neomacs_gui_diagnostic(line) {
+            return Err(format!("malformed Neomacs GUI diagnostic: {line:?}"));
+        }
         let mentions_known_warning = line.contains("GLib-GIO-CRITICAL") || line.contains(CONDITION);
         if !mentions_known_warning {
             normalized.push_str(line);
@@ -292,10 +321,34 @@ fn normalize_gui_stderr(stderr: String) -> Result<String, String> {
         {
             return Err(format!("malformed volatile GNU GIO warning: {line:?}"));
         }
-        normalized.push_str(CANONICAL);
-        normalized.push_str(newline);
+        removed_known_warning = true;
+    }
+    if expected_neomacs_line.is_some() {
+        return Err("malformed Neomacs GUI diagnostic: incomplete warning".into());
+    }
+    if removed_known_warning && normalized.trim().is_empty() {
+        // A warning-only stream can include a blank line before the warning;
+        // do not let that optional framing become a snapshot difference.
+        return Ok(String::new());
     }
     Ok(normalized)
+}
+
+fn known_neomacs_gui_diagnostic_index(line: &str) -> Option<usize> {
+    NEOMACS_GUI_DIAGNOSTICS
+        .iter()
+        .position(|expected| *expected == line)
+        .or_else(|| {
+            NEOMACS_GUI_DIAGNOSTICS_WITH_ANSI
+                .iter()
+                .position(|expected| *expected == line)
+        })
+}
+
+fn resembles_neomacs_gui_diagnostic(line: &str) -> bool {
+    line.starts_with("libEGL warning:")
+        || line.contains("MESA: info:")
+        || line.contains("Note: you can probably enable DRI3 in your Xorg config")
 }
 
 fn valid_gio_timestamp(timestamp: &str) -> bool {
@@ -311,7 +364,7 @@ fn valid_gio_timestamp(timestamp: &str) -> bool {
 }
 
 #[test]
-fn gui_stderr_normalization_preserves_unrelated_diagnostics() {
+fn gui_stderr_normalization_drops_optional_warning_and_preserves_unrelated_diagnostics() {
     let stderr = concat!(
         "before\n\n",
         "(emacs:12345): GLib-GIO-CRITICAL **: 04:23:40.175: ",
@@ -320,12 +373,19 @@ fn gui_stderr_normalization_preserves_unrelated_diagnostics() {
     );
     assert_eq!(
         normalize_gui_stderr(stderr.into()).expect("normalize exact volatile GNU warning"),
-        concat!(
-            "before\n\n",
-            "GLib-GIO-CRITICAL: ",
-            "g_settings_schema_source_lookup: assertion 'source != NULL' failed\n",
-            "after\n",
+        concat!("before\n\n", "after\n",)
+    );
+    assert_eq!(
+        normalize_gui_stderr(
+            concat!(
+                "\n",
+                "(emacs:12345): GLib-GIO-CRITICAL **: 04:23:40.175: ",
+                "g_settings_schema_source_lookup: assertion 'source != NULL' failed\n",
+            )
+            .into()
         )
+        .expect("drop warning-only stderr"),
+        ""
     );
     assert!(
         normalize_gui_stderr(
@@ -334,5 +394,53 @@ fn gui_stderr_normalization_preserves_unrelated_diagnostics() {
         )
         .is_err(),
         "already-normalized or malformed warning input must fail closed"
+    );
+}
+
+#[test]
+fn gui_stderr_normalization_drops_exact_neomacs_llvmpipe_diagnostics_and_ansi_artifacts() {
+    let stderr = concat!(
+        "before\n",
+        "libEGL warning: DRI3 error: Could not get DRI3 device\n",
+        "libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering\n",
+        "\x1b[4m\x1b[31mMESA: info: vulkan: No DRI3 support detected - required for presentation\n",
+        "Note: you can probably enable DRI3 in your Xorg config\x1b[0m\n",
+        "after\n",
+    );
+    assert_eq!(
+        normalize_gui_stderr(stderr.into()).expect("normalize exact Neomacs Xvfb diagnostics"),
+        "before\nafter\n"
+    );
+    let canonical = concat!(
+        "before\n",
+        "libEGL warning: DRI3 error: Could not get DRI3 device\n",
+        "libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering\n",
+        "MESA: info: vulkan: No DRI3 support detected - required for presentation\n",
+        "Note: you can probably enable DRI3 in your Xorg config\n",
+        "after\n",
+    );
+    assert_eq!(
+        normalize_gui_stderr(canonical.into()).expect("normalize canonical Neomacs diagnostics"),
+        "before\nafter\n"
+    );
+}
+
+#[test]
+fn gui_stderr_normalization_fails_closed_for_malformed_neomacs_diagnostics() {
+    let malformed = concat!(
+        "libEGL warning: DRI3 error: Could not get DRI3 device\n",
+        "libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering\n",
+        "MESA: info: vulkan: No DRI3 support detected - required for presentation\n",
+        "Note: you can probably enable DRI3 in the Xorg configuration\n",
+    );
+    assert!(
+        normalize_gui_stderr(malformed.into()).is_err(),
+        "near-match Neomacs diagnostics must not be silently discarded"
+    );
+
+    let unrelated = "\x1b[31munrelated diagnostic\x1b[0m\n";
+    assert_eq!(
+        normalize_gui_stderr(unrelated.into()).expect("preserve unrelated ANSI diagnostics"),
+        "\x1b[31munrelated diagnostic\x1b[0m\n"
     );
 }

@@ -96,16 +96,20 @@ fn real_gui_resize_does_not_ghost_the_previous_presentation() {
         Duration::from_secs(30),
     );
 
-    // Allow one ordinary 60 Hz present after the correctly-sized display
-    // matrix arrives, while remaining well inside the historical 200 ms
-    // resize crossfade that exposed the stale presentation.
-    thread::sleep(Duration::from_millis(50));
-    capture_x11_window(session.env(), &window, &artifacts.png);
-
-    let resized = image::open(&artifacts.png)
-        .expect("decode resized window capture")
-        .to_rgba8();
-    assert_eq!(resized.dimensions(), (new_width, new_height));
+    // `poll_frame` logs when the evaluator's frame reaches the render thread,
+    // not when that frame has reached the X11 surface.  Wait for the visible
+    // post-resize presentation itself: the new mode line must be present at a
+    // row below the old one, and no old-size red pixels may remain.
+    let resized = wait_for_resized_presentation(
+        session.env(),
+        &window,
+        &artifacts.png,
+        &before,
+        &old_mode_rows,
+        new_width,
+        new_height,
+        Duration::from_secs(30),
+    );
     let old_band_red_pixels = old_mode_rows
         .iter()
         .filter(|&&y| y < resized.height())
@@ -131,6 +135,52 @@ fn real_gui_resize_does_not_ghost_the_previous_presentation() {
     if let Some(mut process) = child.0.take() {
         let _ = process.kill();
         let _ = process.wait();
+    }
+}
+
+fn wait_for_resized_presentation(
+    display_env: &[(String, String)],
+    window: &str,
+    output_path: &Path,
+    before: &image::RgbaImage,
+    old_mode_rows: &[u32],
+    new_width: u32,
+    new_height: u32,
+    timeout: Duration,
+) -> image::RgbaImage {
+    let started = Instant::now();
+    let old_last_row = old_mode_rows.iter().copied().max().unwrap_or(0);
+    let mut last_old_band_red_pixels = 0;
+    let mut last_red_rows = Vec::new();
+    loop {
+        capture_x11_window(display_env, window, output_path);
+        let image = image::open(output_path)
+            .expect("decode resized window capture")
+            .to_rgba8();
+        if image.dimensions() == (new_width, new_height) {
+            let old_band_red_pixels = old_mode_rows
+                .iter()
+                .filter(|&&y| y < image.height())
+                .flat_map(|&y| (0..before.width().min(image.width())).map(move |x| (x, y)))
+                .filter(|&(x, y)| is_red_tinted(image.get_pixel(x, y).0))
+                .count();
+            let red_rows = red_tinted_rows(&image);
+            let has_new_mode_line = red_rows.iter().any(|&y| y > old_last_row);
+            last_old_band_red_pixels = old_band_red_pixels;
+            last_red_rows = red_rows;
+            if old_band_red_pixels == 0 && has_new_mode_line {
+                return image;
+            }
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "resized GUI did not visibly present the new mode line without old red pixels \
+             within {timeout:?}; last_old_band_red_pixels={last_old_band_red_pixels} \
+             red_rows={last_red_rows:?}; expected={new_width}x{new_height} \
+             output={}",
+            output_path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

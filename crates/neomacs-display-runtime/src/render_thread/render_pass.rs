@@ -540,6 +540,20 @@ impl RenderApp {
             render_policy.plan_frame(frame_has_theme_transition, renderer.has_frame_post());
         let need_offscreen = feature_plan.use_transition_offscreen;
 
+        let present_mapping = render
+            .present_mapping()
+            .ok_or(FrameRenderFailure::AwaitingContent)?;
+        if !present_mapping.content_matches_surface() {
+            tracing::debug!(
+                frame_width = present_mapping.content_logical_size().width(),
+                frame_height = present_mapping.content_logical_size().height(),
+                surface_width = present_mapping.surface_logical_size().width(),
+                surface_height = present_mapping.surface_logical_size().height(),
+                "skipping redraw until the committed frame matches the resized surface"
+            );
+            return Err(FrameRenderFailure::AwaitingContent);
+        }
+
         let output = if let Some(output) = output {
             output
         } else {
@@ -590,9 +604,6 @@ impl RenderApp {
             }
         };
 
-        let present_mapping = render
-            .present_mapping()
-            .ok_or(FrameRenderFailure::AwaitingContent)?;
         let mut frame = render
             .take_current_frame_for_render()
             .ok_or(FrameRenderFailure::AwaitingContent)?;

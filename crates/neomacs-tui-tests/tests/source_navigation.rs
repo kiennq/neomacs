@@ -50,7 +50,7 @@ fn xref_find_definitions_and_go_back_from_elisp_symbol() {
 #[test]
 fn find_function_via_mx_opens_lisp_definition() {
     let (mut gnu, mut neo) = boot_pair("");
-    use_backend_only_vc_mode_line(&mut gnu, &mut neo);
+    disable_vc_mode_line(&mut gnu, &mut neo);
 
     invoke_mx_command(&mut gnu, &mut neo, "find-function");
     wait_for_both(&mut gnu, &mut neo, Duration::from_secs(8), |grid| {

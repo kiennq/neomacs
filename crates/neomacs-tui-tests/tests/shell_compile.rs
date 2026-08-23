@@ -6,6 +6,33 @@ use neomacs_tui_tests::*;
 use std::time::Duration;
 use support::*;
 
+fn visible_buffer_content_path_fragments(grid: &[String]) -> Option<Vec<String>> {
+    let (row_index, row) = grid
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.contains("buffer-content-"))?;
+    let marker = row.find("buffer-content-")?;
+    let continuation_start = row[..marker]
+        .rfind('|')
+        .map_or(0, |separator| separator + 1);
+    let start = row[..marker]
+        .rfind(|ch: char| ch.is_whitespace() || ch == '|')
+        .map_or(0, |separator| separator + 1);
+    let tail = row.get(start..)?.trim_end();
+    let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    let mut fragments = vec![tail[..end].to_owned()];
+    if end == tail.len()
+        && let Some(continuation) = grid.get(row_index + 1)
+    {
+        let tail = continuation.get(continuation_start..)?.trim_end();
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        if end > 0 {
+            fragments.push(tail[..end].to_owned());
+        }
+    }
+    Some(fragments)
+}
+
 // ── Tests ──────────────────────────────────────────────────
 #[test]
 fn shell_command_via_mbang_displays_short_output() {
@@ -615,30 +642,38 @@ fn diff_buffer_with_file_via_mx_shows_unsaved_changes() {
             "{label} should show added and context diff lines"
         );
     }
-    let visible_buffer_content_path = |session: &neomacs_tui_tests::TuiSession| {
-        session
-            .text_grid()
-            .into_iter()
-            .find_map(|row| {
-                let marker = row.find("buffer-content-")?;
-                let start = row[..marker]
-                    .rfind(|ch: char| ch.is_whitespace() || ch == '|')
-                    .map_or(0, |separator| separator + 1);
-                let end = row[marker..]
-                    .find(char::is_whitespace)
-                    .map_or(row.len(), |offset| marker + offset);
-                Some(row[start..end].to_owned())
-            })
-            .expect("diff command should display its buffer-content temporary path")
-    };
-    let gnu_temp = visible_buffer_content_path(&gnu);
-    let neo_temp = visible_buffer_content_path(&neo);
-    assert_pair_exact_display_with_path_pair(
+    let gnu_temp = visible_buffer_content_path_fragments(&gnu.text_grid())
+        .expect("GNU diff should display its buffer-content temporary path");
+    let neo_temp = visible_buffer_content_path_fragments(&neo.text_grid())
+        .expect("Neomacs diff should display its buffer-content temporary path");
+    assert_eq!(
+        gnu_temp.len(),
+        neo_temp.len(),
+        "paired diff paths should wrap into the same number of terminal rows"
+    );
+    let path_pairs = gnu_temp.into_iter().zip(neo_temp).collect::<Vec<_>>();
+    assert_pair_exact_display_with_path_pairs(
         "diff_buffer_with_file_via_mx_shows_unsaved_changes",
         &gnu,
         &neo,
-        &gnu_temp,
-        &neo_temp,
+        &path_pairs,
+    );
+}
+
+#[test]
+fn visible_buffer_content_path_fragments_capture_terminal_wrapped_suffix() {
+    let grid = vec![
+        "left|--- /tmp/example/buffer-content-".to_string(),
+        "    |D1CM".to_string(),
+        "    |rest".to_string(),
+    ];
+
+    assert_eq!(
+        visible_buffer_content_path_fragments(&grid),
+        Some(vec![
+            "/tmp/example/buffer-content-".to_string(),
+            "D1CM".to_string()
+        ])
     );
 }
 

@@ -23,10 +23,7 @@ use neomacs_display_protocol::font::{
     FontSlantKind, ResolvedFont, ResolvedFontAdvance, ResolvedFontId, ResolvedFontIdentity,
     ResolvedGlyph,
 };
-#[cfg(test)]
-#[cfg(target_os = "linux")]
-use neovm_core::face::FontWeight;
-use neovm_core::face::{FontSlant, FontWidth};
+use neovm_core::face::{FontSlant, FontWeight, FontWidth};
 // Every map in this module is an internal cache keyed by non-adversarial data
 // (font-metrics keys, chars, family names) and looked up per char / per glyph
 // during layout. Use FxHash, not std SipHash: the per-char resolved-font and
@@ -49,6 +46,63 @@ fn platform_foundry_for_file(file: &str) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn platform_foundry_for_file(_file: &str) -> Option<String> {
     None
+}
+
+/// Build the Fontconfig-style name GNU exposes as an opened font's
+/// `full-name`.  The public Lisp font object is assembled in neovm-core, so
+/// the exact selected font must carry this value across the layout boundary
+/// instead of making that layer reconstruct it from the XLFD.
+fn fontconfig_full_name(
+    family: &str,
+    pixel_size: f32,
+    foundry: Option<&str>,
+    weight: u16,
+    slant: FontSlant,
+    width: u16,
+    scalable: bool,
+) -> Option<String> {
+    if family.is_empty() || !pixel_size.is_finite() || pixel_size <= 0.0 {
+        return None;
+    }
+
+    let mut full_name = format!("{family}:pixelsize={}", pixel_size.round().max(1.0) as u32);
+    if let Some(foundry) = foundry.filter(|foundry| !foundry.is_empty()) {
+        full_name.push_str(&format!(":foundry={foundry}"));
+    }
+    full_name.push_str(":weight=");
+    full_name.push_str(match FontWeight::from_css_weight(weight).gnu_numeric() {
+        0 => "thin",
+        40 => "ultra-light",
+        50 => "light",
+        55 => "semi-light",
+        80 => "regular",
+        100 => "medium",
+        180 => "semi-bold",
+        200 => "bold",
+        205 => "extra-bold",
+        210 => "black",
+        _ => "ultra-heavy",
+    });
+    full_name.push_str(":slant=");
+    full_name.push_str(slant.symbol_name());
+    full_name.push_str(":width=");
+    full_name.push_str(match width {
+        1 => "ultra-condensed",
+        2 => "extra-condensed",
+        3 => "condensed",
+        4 => "semi-condensed",
+        6 => "semi-expanded",
+        7 => "expanded",
+        8 => "extra-expanded",
+        9 => "ultra-expanded",
+        _ => "normal",
+    });
+    full_name.push_str(if scalable {
+        ":scalable=true"
+    } else {
+        ":scalable=false"
+    });
+    Some(full_name)
 }
 
 /// Font metrics returned for a given face configuration.
@@ -1804,6 +1858,12 @@ impl FontMetricsService {
         // Only the semantic fallback path needs a representative-glyph probe.
         let resolved_family = self.resolve_family(&self.font_resolver.resolve_family(family), None);
         let platform = self.platform_primary_match(&resolved_family, weight, italic, font_size);
+        let platform_foundry = platform
+            .as_ref()
+            .and_then(|matched| matched.metadata.foundry.clone());
+        let scalable = platform
+            .as_ref()
+            .map_or(true, |matched| !matched.metadata.size.is_fixed());
         let spacing = platform
             .as_ref()
             .map(|matched| matched.metadata.fixed_spacing_policy())
@@ -1918,6 +1978,20 @@ impl FontMetricsService {
                     )
                 }
             };
+        let file_foundry = identity
+            .file_path
+            .as_deref()
+            .and_then(platform_foundry_for_file);
+        let foundry = platform_foundry.as_deref().or(file_foundry.as_deref());
+        let full_name = fontconfig_full_name(
+            &resolved_family,
+            font_size,
+            foundry,
+            resolved_weight,
+            selector_slant,
+            stretch.to_number(),
+            scalable,
+        );
         let px_metrics = platform_px_metrics
             .or_else(|| Self::probe_resolved_font_metrics(&identity, None, font_size))
             .or_else(|| {
@@ -1945,7 +2019,7 @@ impl FontMetricsService {
                 identity,
                 replay,
                 family: resolved_family,
-                full_name: None,
+                full_name,
                 postscript_name,
                 // Preserve the resolved CSS weight, not the container face's
                 // metadata weight (variable fonts; cf. `select_font_for_char`).
@@ -2003,6 +2077,15 @@ impl FontMetricsService {
             resolved_font_advance(matched.metadata.fixed_spacing_policy(), Some(px_metrics));
         let identity = matched.identity.clone();
         let selector_slant = matched.slant();
+        let full_name = fontconfig_full_name(
+            family,
+            effective_size,
+            matched.metadata.foundry.as_deref(),
+            matched.weight().unwrap_or(requested_weight),
+            selector_slant,
+            matched.metadata.width_class(),
+            !matched.metadata.size.is_fixed(),
+        );
         let replay = opened.replay();
         let id = self.intern_resolved_font_id(&identity, replay.clone(), effective_size);
         Some(LayoutFontHandle {
@@ -2011,7 +2094,7 @@ impl FontMetricsService {
                 identity,
                 replay,
                 family: family.to_owned(),
-                full_name: None,
+                full_name,
                 postscript_name: matched.identity.postscript_name.clone(),
                 weight: matched.weight().unwrap_or(requested_weight),
                 slant: font_slant_kind_from_platform(selector_slant),
@@ -2215,6 +2298,27 @@ impl FontMetricsService {
                     )
                 }
             };
+        let file_foundry = identity
+            .file_path
+            .as_deref()
+            .and_then(platform_foundry_for_file);
+        let foundry = resolved
+            .platform
+            .as_ref()
+            .and_then(|matched| matched.metadata.foundry.as_deref())
+            .or(file_foundry.as_deref());
+        let full_name = fontconfig_full_name(
+            &resolved.family,
+            selection.font_size,
+            foundry,
+            resolved.weight,
+            selector_slant,
+            stretch.to_number(),
+            resolved
+                .platform
+                .as_ref()
+                .map_or(true, |matched| !matched.metadata.size.is_fixed()),
+        );
         let px_metrics = Self::probe_resolved_font_metrics(
             &identity,
             resolved.platform.as_ref(),
@@ -2243,7 +2347,7 @@ impl FontMetricsService {
                 identity,
                 replay,
                 family: resolved.family.clone(),
-                full_name: None,
+                full_name,
                 postscript_name,
                 weight: resolved.weight,
                 slant: render_slant,
@@ -2521,15 +2625,27 @@ impl FontMetricsService {
         let glyph_advance = resolved_font_advance(spacing, px_metrics);
         let replay = swash_file_replay(&identity)?;
         let id = self.intern_resolved_font_id(&identity, replay.clone(), font_size);
+        let selector_slant = font_slant_from_fontdb(style);
+        let render_slant = font_slant_kind_from_fontdb(style);
+        let file_foundry = file.as_deref().and_then(platform_foundry_for_file);
+        let full_name = fontconfig_full_name(
+            &family,
+            font_size,
+            file_foundry.as_deref(),
+            file_weight,
+            selector_slant,
+            stretch.to_number(),
+            true,
+        );
         Some(ResolvedFont {
             id,
             identity,
             replay,
             family,
-            full_name: None,
+            full_name,
             postscript_name,
             weight: file_weight,
-            slant: font_slant_kind_from_fontdb(style),
+            slant: render_slant,
             width: stretch.to_number(),
             pixel_size: font_size,
             ascent_px: vertical.as_ref().map(|v| v.ascent).unwrap_or(0.0),

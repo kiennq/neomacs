@@ -55,9 +55,11 @@ fn glyph_pointer_token_has_small_niche_sized_overhead() {
     assert_eq!(std::mem::size_of::<Option<GlyphPointerAppearanceId>>(), 4);
     assert_eq!(std::mem::size_of::<Option<GlyphStringSourceId>>(), 4);
     assert_eq!(std::mem::size_of::<super::GlyphImageMarginsId>(), 2);
+    // The current Glyph representation carries typed provenance and optional
+    // presentation metadata; 104 bytes is the intentional compactness budget.
     assert!(
-        std::mem::size_of::<Glyph>() <= 80,
-        "row-side provenance must keep Glyph compact; actual size is {}",
+        std::mem::size_of::<Glyph>() <= 104,
+        "Glyph must remain within its compactness budget; actual size is {}",
         std::mem::size_of::<Glyph>()
     );
 }

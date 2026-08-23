@@ -4767,14 +4767,111 @@ fn find_file_ascii_elisp_with_newline_publishes_prefer_utf8_unix_coding() {
         .eval_str(&format!(
             r##"(progn
                    (set-language-environment "UTF-8")
-                   (let ((buffer (find-file-noselect "{path_lisp}")))
-                     (with-current-buffer buffer
-                       (list last-coding-system-used
-                             buffer-file-coding-system))))"##
+                   (setq neovm-prefer-utf8-hook-coding nil)
+                   (setq neovm-prefer-utf8-real-hook
+                         (symbol-function 'after-insert-file-set-coding))
+                   (defalias 'after-insert-file-set-coding
+                     (lambda (inserted visit)
+                       (or neovm-prefer-utf8-hook-coding
+                           (setq neovm-prefer-utf8-hook-coding
+                                 last-coding-system-used))
+                       (funcall neovm-prefer-utf8-real-hook inserted visit)))
+                   (unwind-protect
+                       (let ((buffer (find-file-noselect "{path_lisp}")))
+                         (with-current-buffer buffer
+                           (list neovm-prefer-utf8-hook-coding
+                                 buffer-file-coding-system)))
+                     (fset 'after-insert-file-set-coding
+                           neovm-prefer-utf8-real-hook)))"##
         ))
         .expect("visit newline-terminated ASCII file");
 
     assert_eq!(format!("{result}"), "(prefer-utf-8-unix prefer-utf-8-unix)");
+}
+
+#[test]
+fn find_file_utf8_signature_elisp_preserves_detected_coding() {
+    crate::test_utils::init_test_tracing();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("utf8-signature.el");
+    fs::write(&path, b"\xEF\xBB\xBF(message \"utf-8 signature\")\n")
+        .expect("write UTF-8 signature fixture");
+    let path_lisp = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let mut eval = crate::test_utils::runtime_startup_context();
+
+    let result = eval
+        .eval_str(&format!(
+            r##"(progn
+                   (set-language-environment "UTF-8")
+                   (setq neovm-signature-hook-coding nil)
+                   (setq neovm-signature-real-hook
+                         (symbol-function 'after-insert-file-set-coding))
+                   (defalias 'after-insert-file-set-coding
+                     (lambda (inserted visit)
+                       (or neovm-signature-hook-coding
+                           (setq neovm-signature-hook-coding
+                                 last-coding-system-used))
+                       (funcall neovm-signature-real-hook inserted visit)))
+                   (unwind-protect
+                       (let ((set-auto-coding-function nil)
+                             (file-coding-system-alist
+                              (cons (cons "\\.el\\'"
+                                          (cons 'prefer-utf-8 'prefer-utf-8))
+                                    file-coding-system-alist)))
+                         (let ((buffer (find-file-noselect "{path_lisp}")))
+                           (with-current-buffer buffer
+                             (list neovm-signature-hook-coding
+                                   buffer-file-coding-system))))
+                     (fset 'after-insert-file-set-coding
+                           neovm-signature-real-hook)))"##
+        ))
+        .expect("visit UTF-8 signature file");
+
+    assert_eq!(
+        format!("{result}"),
+        "(utf-8-with-signature-unix utf-8-with-signature-unix)"
+    );
+}
+
+#[test]
+fn find_file_latin1_elisp_preserves_detected_non_utf8_coding() {
+    crate::test_utils::init_test_tracing();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("latin1.el");
+    fs::write(&path, b"(message \"caf\xe9\")\n").expect("write Latin-1 fixture");
+    let path_lisp = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let mut eval = crate::test_utils::runtime_startup_context();
+
+    let result = eval
+        .eval_str(&format!(
+            r##"(progn
+                   (set-language-environment "UTF-8")
+                   (setq neovm-latin1-hook-coding nil)
+                   (setq neovm-latin1-real-hook
+                         (symbol-function 'after-insert-file-set-coding))
+                   (defalias 'after-insert-file-set-coding
+                     (lambda (inserted visit)
+                       (or neovm-latin1-hook-coding
+                           (setq neovm-latin1-hook-coding
+                                 last-coding-system-used))
+                       (funcall neovm-latin1-real-hook inserted visit)))
+                   (unwind-protect
+                       (let ((buffer (find-file-noselect "{path_lisp}")))
+                         (with-current-buffer buffer
+                           (list neovm-latin1-hook-coding
+                                 buffer-file-coding-system)))
+                     (fset 'after-insert-file-set-coding
+                           neovm-latin1-real-hook)))"##
+        ))
+        .expect("visit Latin-1 file");
+
+    assert_eq!(format!("{result}"), "(iso-latin-1-unix iso-latin-1-unix)");
 }
 
 #[cfg(unix)]

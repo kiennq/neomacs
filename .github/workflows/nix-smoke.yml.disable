@@ -1,4 +1,4 @@
-name: nix smoke
+name: Nix contracts
 
 on:
   pull_request:

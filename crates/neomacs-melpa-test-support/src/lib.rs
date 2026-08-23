@@ -347,6 +347,11 @@ impl EmacsRuntime {
             Ok(reference) => {
                 runtime.executable = reference.executable().to_path_buf();
                 runtime.reference = Some(reference);
+                runtime
+                    .extra_env
+                    .extend(neomacs_parity_reference::uninstalled_gnu_environment(
+                        &runtime.executable,
+                    ));
             }
             Err(
                 error @ neomacs_parity_reference::AttestationError::ExecutableUnresolved { .. },
@@ -406,6 +411,13 @@ impl EmacsRuntime {
             command.env(name, value);
         }
         command
+    }
+
+    #[cfg(all(unix, feature = "tui"))]
+    pub(crate) fn process_environment(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.extra_env
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
     }
 }
 

@@ -943,20 +943,26 @@ fn runtime_tree_file_spec(checkout: &Path) -> Result<String, String> {
                 let relative = path
                     .strip_prefix(root)
                     .expect("runtime entry is below root");
-                let relative = relative.to_str().ok_or_else(|| {
-                    format!(
-                        "source runtime tree {} contains a non-UTF-8 path {}",
-                        root.display(),
-                        relative.display()
-                    )
-                })?;
-                if !safe_source_path(relative) {
+                let relative = relative
+                    .iter()
+                    .map(|component| {
+                        component.to_str().ok_or_else(|| {
+                            format!(
+                                "source runtime tree {} contains a non-UTF-8 path {}",
+                                root.display(),
+                                relative.display()
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("/");
+                if !safe_source_path(&relative) {
                     return Err(format!(
                         "source runtime tree {} contains unsafe path `{relative}`",
                         root.display()
                     ));
                 }
-                files.push(relative.to_string());
+                files.push(relative);
             }
         }
         Ok(())

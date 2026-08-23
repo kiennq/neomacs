@@ -802,12 +802,12 @@ impl Default for TaggedHeap {
 // — the companion to `NEOVM_GC_STRESS=1`, which is what makes a missing root
 // deterministic — or per-thread from a test.
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 thread_local! {
     static VERIFY_MARKED_OBJECTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn verify_marked_objects_enabled() -> bool {
     static FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let from_env =
@@ -816,7 +816,7 @@ fn verify_marked_objects_enabled() -> bool {
 }
 
 /// Turn post-mark ownership verification on for THIS thread.
-#[cfg(all(debug_assertions, test))]
+#[cfg(test)]
 pub(crate) fn set_verify_marked_objects_for_test(on: bool) {
     VERIFY_MARKED_OBJECTS.with(|flag| flag.set(on));
 }

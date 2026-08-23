@@ -7,7 +7,6 @@
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -565,9 +564,6 @@ fn start_xvfb(artifact_root: &Path) -> io::Result<DisplaySession> {
 }
 
 fn start_xvfb_on(artifact_root: &Path, display_number: u32) -> io::Result<DisplaySession> {
-    let port_number = u16::try_from(6000 + display_number)
-        .map_err(|_| io::Error::other(format!("X display {display_number} has no TCP port")))?;
-    let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_number);
     let display = format!("127.0.0.1:{display_number}");
     let session_dir = artifact_root.join(format!("xvfb-{}-{display_number}", std::process::id()));
     fs::create_dir(&session_dir)?;
@@ -618,12 +614,13 @@ fn start_xvfb_on(artifact_root: &Path, display_number: u32) -> io::Result<Displa
         .spawn()?;
     pending.child = Some(child);
 
-    if wait_for_tcp_display(
+    if wait_for_x11_display(
         pending
             .child
             .as_mut()
             .expect("pending Xvfb owns its spawned child"),
-        endpoint,
+        &display,
+        &authority_path,
         Duration::from_secs(5),
     )? {
         return Ok(pending.into_session(vec![
@@ -635,7 +632,7 @@ fn start_xvfb_on(artifact_root: &Path, display_number: u32) -> io::Result<Displa
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "Xvfb did not come up on loopback display {display} ({endpoint}); stderr: {diagnostics}"
+            "Xvfb did not complete an X11 handshake on loopback display {display}; stderr: {diagnostics}"
         ),
     ))
 }
@@ -677,9 +674,10 @@ impl Drop for PendingXvfbSession {
     }
 }
 
-fn wait_for_tcp_display(
+fn wait_for_x11_display(
     child: &mut Child,
-    endpoint: SocketAddr,
+    display: &str,
+    authority_path: &Path,
     timeout: Duration,
 ) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
@@ -687,7 +685,14 @@ fn wait_for_tcp_display(
         if child.try_wait()?.is_some() {
             return Ok(false);
         }
-        if TcpStream::connect_timeout(&endpoint, Duration::from_millis(100)).is_ok() {
+        let status = Command::new("xdpyinfo")
+            .arg("-display")
+            .arg(display)
+            .env("XAUTHORITY", authority_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
             return Ok(child.try_wait()?.is_none());
         }
         thread::sleep(Duration::from_millis(20));

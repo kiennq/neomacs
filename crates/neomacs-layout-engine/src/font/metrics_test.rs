@@ -55,6 +55,40 @@ fn metrics_cache_identity_includes_the_fontset_generation() {
     assert_ne!(before, after);
 }
 
+#[test]
+fn fontconfig_full_name_uses_gnu_canonical_style_names() {
+    assert_eq!(
+        super::fontconfig_full_name(
+            "Noto Sans",
+            21.0,
+            Some("GOOG"),
+            700,
+            FontSlant::Italic,
+            5,
+            true,
+        ),
+        Some(
+            "Noto Sans:pixelsize=21:foundry=GOOG:weight=bold:slant=italic:width=normal:scalable=true"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        super::fontconfig_full_name(
+            "Noto Sans",
+            21.0,
+            Some("GOOG"),
+            400,
+            FontSlant::Normal,
+            5,
+            true,
+        ),
+        Some(
+            "Noto Sans:pixelsize=21:foundry=GOOG:weight=regular:slant=normal:width=normal:scalable=true"
+                .to_owned()
+        )
+    );
+}
+
 // ---------------------------------------------------------------
 // char_width: basic sanity
 // ---------------------------------------------------------------

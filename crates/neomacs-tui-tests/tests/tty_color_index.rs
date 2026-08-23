@@ -21,7 +21,7 @@
 //! next to the search they gate, in
 //! `crates/neomacs-display-protocol/src/tty_palette_data/`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -109,15 +109,18 @@ const PROBE_MARKERS: [(&str, &str); 6] = [
 struct Editor {
     name: &'static str,
     program: PathBuf,
+    environment: Vec<(OsString, OsString)>,
     /// GNU's async native compiler can pop *Warnings* mid-run; keep it quiet so
     /// the captured bytes are the probe's and nothing else's.
     extra_args: Vec<String>,
 }
 
 fn gnu() -> Editor {
+    let (program, environment) = neomacs_tui_tests::gnu_emacs_program();
     Editor {
         name: "GNU",
-        program: PathBuf::from("emacs"),
+        program: PathBuf::from(program),
+        environment,
         extra_args: vec![
             "-no-comp-spawn".to_string(),
             "--eval=(progn(set'native-comp-jit-compilation())(set'native-comp-async-report-warnings-errors'silent))".to_string(),
@@ -135,6 +138,7 @@ fn neomacs() -> Editor {
     Editor {
         name: "Neomacs",
         program,
+        environment: Vec::new(),
         extra_args: Vec::new(),
     }
 }
@@ -164,6 +168,7 @@ fn run_on_pty(
     for arg in &editor.extra_args {
         launch = launch.arg(arg);
     }
+    launch = launch.envs(editor.environment.iter().cloned());
     launch = launch
         .arg("-l")
         .arg(&script)

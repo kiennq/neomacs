@@ -103,6 +103,7 @@ macro_rules! skip_unless_oracle {
 /// than the in-process oracle tests. Keep the limit high enough for normal
 /// startup while retaining an explicit runaway ceiling; callers can still
 /// override it with `NEOVM_ORACLE_MEM_LIMIT_MB`.
+#[cfg(unix)]
 fn oracle_mem_limit_bytes() -> u64 {
     let mb: u64 = std::env::var("NEOVM_ORACLE_MEM_LIMIT_MB")
         .ok()
@@ -134,13 +135,12 @@ fn apply_memory_limit(cmd: &mut Command) {
 /// RLIMIT_AS is Unix-only; non-Unix hosts run spawned probes unlimited.
 #[cfg(not(unix))]
 fn apply_memory_limit(_cmd: &mut Command) {}
-
 /// Spawn the under-test `neomacs` binary with the given argv (passed
 /// after `argv[0]`, which Cargo provides via the `CARGO_BIN_EXE_neomacs`
 /// env var).
 ///
 /// Stdin is closed; stdout and stderr are captured. The subprocess is
-/// memory-limited via RLIMIT_AS the same way oracle Emacs is.
+/// memory-limited via RLIMIT_AS on Unix the same way oracle Emacs is.
 pub fn run_neomacs(argv: &[&str]) -> ProbeResult {
     run_neomacs_with_stdin(argv, "")
 }

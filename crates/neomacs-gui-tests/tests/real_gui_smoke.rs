@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use neomacs_gui_tests::{
@@ -118,7 +118,7 @@ fn oversized_xwidget_keeps_its_intrinsic_page_visible_behind_the_window_clip() {
     let binary = neomacs_binary(&workspace_root);
     assert!(
         binary.exists(),
-        "build {binary:?} with --features webview before running the xwidget regression"
+        "build {binary:?} before running the xwidget regression"
     );
 
     let artifact_root = workspace_root.join("target/neomacs-gui-tests");
@@ -131,6 +131,7 @@ fn oversized_xwidget_keeps_its_intrinsic_page_visible_behind_the_window_clip() {
     );
     let mut plan = GuiTestPlan::new(backend, &workspace_root, &artifact_root, scenario)
         .with_program(binary)
+        .with_env("RUST_LOG", "warn")
         // Keep readback armed until WPE publishes its first page texture.
         .with_env("NEOMACS_DEBUG_SURFACE_READBACK", "120");
     for (key, value) in session.env() {
@@ -193,6 +194,19 @@ fn oversized_xwidget_keeps_its_intrinsic_page_visible_behind_the_window_clip() {
          advance={layout_advance}, text={text_width}"
     );
 
+    let stdout = std::fs::read_to_string(&result.artifacts.stdout)
+        .expect("oversized xwidget stdout artifact");
+    let stderr = std::fs::read_to_string(&result.artifacts.stderr)
+        .expect("oversized xwidget stderr artifact");
+    let output = format!("{stdout}\n{stderr}");
+    if webview_backend_unavailable(&output) {
+        eprintln!(
+            "skipping WebView pixel-composition assertion: runtime reported no WebView \
+             backend; semantic oversized-xwidget assertions passed"
+        );
+        return;
+    }
+
     let readback = image::open(&result.artifacts.png)
         .expect("decode oversized xwidget surface readback")
         .to_rgba8();
@@ -228,6 +242,34 @@ fn xwidget_glyph(snapshot: &serde_json::Value) -> Option<(u64, &serde_json::Valu
 
 fn is_webview_magenta([red, green, blue, _alpha]: [u8; 4]) -> bool {
     red >= 200 && green <= 80 && blue >= 200
+}
+
+const NO_WEBVIEW_BACKEND_WARNING: &str = "this build has no WebView backend; dropping command";
+
+fn webview_backend_unavailable(output: &str) -> bool {
+    output.contains(NO_WEBVIEW_BACKEND_WARNING)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::webview_backend_unavailable;
+
+    #[test]
+    fn webview_capability_signal_requires_the_exact_runtime_warning() {
+        assert!(webview_backend_unavailable(
+            "WARN this build has no WebView backend; dropping command view=WebViewId(1)"
+        ));
+        assert!(webview_backend_unavailable(
+            "stdout: WARN this build has no WebView backend; dropping command view=WebViewId(1)\n\
+             stderr: unrelated diagnostic"
+        ));
+        assert!(!webview_backend_unavailable(
+            "WebView backend initialization failed: WPE process exited"
+        ));
+        assert!(!webview_backend_unavailable(
+            "this build has no WebView backend"
+        ));
+    }
 }
 
 #[test]
@@ -542,6 +584,16 @@ fn gnu_image_oracle_command(
         ),
         ("GDK_BACKEND".to_string(), "x11".to_string()),
     ];
+    env.extend(
+        neomacs_parity_reference::uninstalled_gnu_environment(program)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            }),
+    );
     env.extend(display_env.iter().cloned());
     CommandSpec {
         program: program.to_path_buf(),
@@ -577,9 +629,29 @@ fn neomacs_binary(workspace_root: &std::path::Path) -> PathBuf {
 }
 
 fn gnu_emacs_binary() -> PathBuf {
-    std::env::var_os("NEOMACS_GUI_TEST_GNU_EMACS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/exec/.local/bin/emacs"))
+    let requested = [
+        "NEOMACS_GUI_TEST_GNU_EMACS",
+        "NEOVM_FORCE_ORACLE_PATH",
+        "NEOMACS_MELPA_ORACLE_EMACS",
+        "NEOVM_ORACLE_EMACS",
+        "ORACLE_EMACS",
+    ]
+    .into_iter()
+    .find_map(std::env::var_os)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from("/home/exec/.local/bin/emacs"));
+
+    match neomacs_parity_reference::attest(
+        Path::new(&requested),
+        neomacs_parity_reference::AttestationDepth::Fingerprint,
+    ) {
+        Ok(reference) => reference.executable().to_path_buf(),
+        Err(neomacs_parity_reference::AttestationError::ExecutableUnresolved { .. }) => requested,
+        Err(error) => panic!(
+            "the GNU GUI oracle is present but is NOT the pinned reference; \
+             refusing to compare against it\n{error}"
+        ),
+    }
 }
 
 fn gnu_font_oracle_command(
@@ -602,6 +674,16 @@ fn gnu_font_oracle_command(
             case_filter.to_string(),
         ));
     }
+    env.extend(
+        neomacs_parity_reference::uninstalled_gnu_environment(program)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            }),
+    );
     env.extend(display_env.iter().cloned());
     CommandSpec {
         program: program.to_path_buf(),

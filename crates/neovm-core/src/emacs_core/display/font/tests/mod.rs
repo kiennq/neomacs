@@ -1774,6 +1774,63 @@ fn opened_font_retains_exact_backend_identity_and_variations() {
 }
 
 #[test]
+fn font_info_uses_zero_default_ascent_but_preserves_rendering_ascent() {
+    let mut face = RuntimeFace::new("default");
+    face.family = Some(Value::symbol("Noto Sans"));
+    let font = finish_opened_font(
+        font_object_property_fields(&face, Some(18)),
+        Some(&LispString::from_utf8("/tmp/NotoSans.ttf")),
+        None,
+        OpenedFontMetrics {
+            pixel_size: 18,
+            height: 22,
+            max_width: 14,
+            ascent: 17,
+            descent: 5,
+            space_width: 9,
+            average_width: 11,
+        },
+        Value::NIL,
+        neomacs_display_protocol::font::ResolvedFontIdentity::from_file(
+            "/tmp/NotoSans.ttf",
+            0,
+            None,
+        ),
+    );
+
+    let info = OpenedFont::decode(font)
+        .expect("finished font should decode")
+        .info_vector();
+    let values = info.as_vector_data().expect("font-info vector");
+
+    assert_eq!(values[6].as_int(), Some(0));
+    assert_eq!(values[8].as_int(), Some(17));
+}
+
+#[test]
+fn font_info_runtime_fallback_uses_zero_default_ascent() {
+    let mut eval = crate::emacs_core::Context::new();
+    let frame_id = ensure_selected_gui_frame(&mut eval);
+    {
+        let frame = eval
+            .frame_manager_mut()
+            .get_mut(frame_id)
+            .expect("selected frame");
+        frame.font_pixel_size = 18.0;
+        frame.char_width = 9.0;
+        frame.char_height = 20.0;
+    }
+
+    let info = font_info(&mut eval, vec![Value::string("Noto Sans-18")])
+        .expect("runtime font fallback should produce font-info");
+    let values = info.as_vector_data().expect("font-info vector");
+
+    assert_eq!(values[6].as_int(), Some(0));
+    assert_eq!(values[8].as_int(), Some(15));
+    assert_eq!(values[9].as_int(), Some(5));
+}
+
+#[test]
 fn font_info_eval_reports_font_vector_file_slot_on_live_gui_frame() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::Context::new();

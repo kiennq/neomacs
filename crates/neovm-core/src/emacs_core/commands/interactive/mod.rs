@@ -359,15 +359,6 @@ impl InteractiveRegistry {
         self.where_is_reverse_index_remapping_lookup_count
     }
 
-    fn cached_where_is_sequences(
-        &self,
-        keymaps: &[Value],
-        definition: Value,
-    ) -> Option<Vec<Vec<Value>>> {
-        self.cached_where_is_reverse_index(keymaps)
-            .map(|index| index.sequences_for(definition))
-    }
-
     fn cached_where_is_reverse_index(&self, keymaps: &[Value]) -> Option<&WhereIsReverseIndex> {
         self.where_is_reverse_index
             .as_ref()
@@ -4442,11 +4433,7 @@ fn where_is_raw_sequences(
     noindirect: bool,
 ) -> Vec<Vec<Value>> {
     if no_menu_bindings && !noindirect {
-        ensure_where_is_reverse_index(eval, keymaps);
-        return eval
-            .interactive
-            .cached_where_is_sequences(keymaps, definition)
-            .expect("where-is reverse index was just ensured");
+        return ensure_where_is_reverse_index(eval, keymaps).sequences_for(definition);
     }
 
     // GNU clears the shared reverse cache when asked to use a lookup mode for
@@ -4467,17 +4454,28 @@ fn where_is_raw_sequences(
     sequences
 }
 
-fn ensure_where_is_reverse_index(eval: &mut Context, keymaps: &[Value]) {
+fn ensure_where_is_reverse_index<'a>(
+    eval: &'a mut Context,
+    keymaps: &[Value],
+) -> &'a WhereIsReverseIndex {
     if eval
         .interactive
         .cached_where_is_reverse_index(keymaps)
         .is_some()
     {
-        return;
+        return eval
+            .interactive
+            .where_is_reverse_index
+            .as_ref()
+            .expect("where-is reverse index was just found");
     }
 
     let index = build_where_is_reverse_index(eval.obarray(), keymaps);
     eval.interactive.install_where_is_reverse_index(index);
+    eval.interactive
+        .where_is_reverse_index
+        .as_ref()
+        .expect("where-is reverse index was just installed")
 }
 
 fn where_is_indexed_command_remapping(
@@ -4485,14 +4483,11 @@ fn where_is_indexed_command_remapping(
     keymaps: &[Value],
     command: SymId,
 ) -> Option<Value> {
-    ensure_where_is_reverse_index(eval, keymaps);
+    let remapping = ensure_where_is_reverse_index(eval, keymaps).remapping_for(command);
     #[cfg(test)]
     eval.interactive
         .note_where_is_reverse_index_remapping_lookup();
-    eval.interactive
-        .cached_where_is_reverse_index(keymaps)
-        .expect("where-is reverse index was just ensured")
-        .remapping_for(command)
+    remapping
 }
 
 /// Scan every accessible binding once and group its key sequences by command.

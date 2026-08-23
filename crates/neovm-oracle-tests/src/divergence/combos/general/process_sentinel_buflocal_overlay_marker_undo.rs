@@ -55,13 +55,16 @@ fn combo_process_filter_insert_with_markers_overlays() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
     let expect = expect_test::expect![[
-        r#""OK (((\"1\\n2\\n3\\n4\\n5\\n\" 1 6 t)) (#(\"START-END\\nProcess seq-test finished\\n\" 0 5 (kind init)) 1 6 t all init))""#
+        r#""OK ((\"1\\n2\\n3\\n4\\n5\\n\" ((1 6 t))) (#(\"START-END\\nProcess seq-test finished\\n\" 0 5 (kind init)) 1 6 t all init))""#
     ]];
-    // Process filter inserts text incrementally; markers must track.
+    // Filter callback chunk boundaries are not a GNU semantic contract.
+    // Preserve the complete output while checking marker/overlay state
+    // independently of how many callbacks delivered it.
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (let ((buf (generate-new-buffer " combo-pf"))
-        (filter-outputs nil))
+        (filter-output "")
+        (filter-states nil))
     (with-current-buffer buf
       (insert "START-END")
       (let ((m-start (copy-marker 1 t))
@@ -73,11 +76,11 @@ fn combo_process_filter_insert_with_markers_overlays() {
         (let ((proc (start-process "seq-test" buf "seq" "1" "5")))
           (set-process-filter proc
             (lambda (p output)
-              (push (list output
-                          (marker-position m-start)
+              (setq filter-output (concat filter-output output))
+              (push (list (marker-position m-start)
                           (marker-position m-end)
                           (and (overlay-start ov) t))
-                    filter-outputs)))
+                    filter-states)))
           (while (accept-process-output proc 0.5))
           (sit-for 0.2)
           (let ((final (list (buffer-string)
@@ -87,7 +90,9 @@ fn combo_process_filter_insert_with_markers_overlays() {
                              (overlay-get ov 'scope)
                              (get-text-property 1 'kind))))
             (kill-buffer buf)
-            (list (nreverse filter-outputs) final))))))) "#,
+            (list (list filter-output
+                        (delete-dups (nreverse filter-states)))
+                  final))))))) "#,
         expect,
     );
 }

@@ -14,6 +14,12 @@
 //! full before/after of every field it is about to change, and appends a dated
 //! line to the log inside the manifest.  The record is written by the same act
 //! that changes the pin, which is the only way it does not get forgotten.
+//!
+//! Automatic mirror detection is deliberately conservative: if `--mirror-commit`
+//! is omitted, the executable must be inside a checkout whose
+//! `remote.origin.url` identifies `emacs-mirror/emacs`.  Use
+//! `--mirror-commit SHA` explicitly for an extracted or otherwise detached
+//! binary that has no GNU mirror checkout metadata.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -391,6 +397,28 @@ fn mirror_commit(executable: &Path) -> Result<String> {
     let directory = executable
         .parent()
         .ok_or_else(|| "pin-reference: the executable has no parent directory".to_string())?;
+    let origin = Command::new("git")
+        .args(["-C"])
+        .arg(directory)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .map_err(|error| format!("pin-reference: cannot run git: {error}"))?;
+    if !origin.status.success() {
+        return Err(format!(
+            "pin-reference: {} is not an emacs-mirror/emacs checkout, so the mirror commit \
+             cannot be inferred; pass --mirror-commit SHA",
+            directory.display()
+        ));
+    }
+    let origin = String::from_utf8_lossy(&origin.stdout).trim().to_string();
+    if !is_emacs_mirror_url(&origin) {
+        return Err(format!(
+            "pin-reference: the checkout at {} has origin {origin:?}, not \
+             emacs-mirror/emacs; pass --mirror-commit SHA",
+            directory.display()
+        ));
+    }
+
     let output = Command::new("git")
         .args(["-C"])
         .arg(directory)
@@ -428,9 +456,72 @@ fn mirror_commit(executable: &Path) -> Result<String> {
     Ok(commit)
 }
 
+fn is_emacs_mirror_url(url: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    let path = [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "ssh://github.com/",
+        "git+ssh://git@github.com/",
+        "git+ssh://github.com/",
+    ]
+    .into_iter()
+    .find_map(|prefix| url.strip_prefix(prefix))
+    .or_else(|| url.strip_prefix("git@github.com:"));
+    let Some(path) = path else {
+        return false;
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    path == "emacs-mirror/emacs"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_origin_accepts_https_forms() {
+        for url in [
+            "https://github.com/emacs-mirror/emacs.git",
+            "https://github.com/emacs-mirror/emacs",
+            "https://github.com/emacs-mirror/emacs.git/",
+        ] {
+            assert!(
+                is_emacs_mirror_url(url),
+                "{url} should identify the GNU mirror"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_origin_accepts_ssh_forms() {
+        for url in [
+            "git@github.com:emacs-mirror/emacs.git",
+            "ssh://git@github.com/emacs-mirror/emacs.git",
+            "ssh://github.com/emacs-mirror/emacs",
+        ] {
+            assert!(
+                is_emacs_mirror_url(url),
+                "{url} should identify the GNU mirror"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_origin_rejects_the_neomacs_checkout() {
+        for url in [
+            "https://github.com/kiennq/neomacs.git",
+            "git@github.com:kiennq/neomacs.git",
+            "https://github.com/emacs-mirror/emacs-fork.git",
+            "https://github.com/emacs-mirror/emacs-other",
+        ] {
+            assert!(
+                !is_emacs_mirror_url(url),
+                "{url} must not identify the GNU mirror"
+            );
+        }
+    }
 
     fn manifest() -> ReferenceManifest {
         ReferenceManifest {

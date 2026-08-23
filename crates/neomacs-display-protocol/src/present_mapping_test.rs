@@ -108,3 +108,29 @@ fn mapping_types_keep_frame_device_and_root_surface_spaces_distinct() {
     let _: crate::GeometryRect<RootSurfaceSpace, LogicalPixels> =
         mapping.visible_content_rect().unwrap();
 }
+
+#[test]
+fn present_mapping_reports_when_the_committed_frame_matches_the_live_surface() {
+    let matching =
+        PresentMapping::top_left_clip(drawable(1100, 760, 1.0), content(13, 1100.0, 760.0));
+    assert!(matching.content_matches_surface());
+
+    let stale = PresentMapping::top_left_clip(drawable(1100, 760, 1.0), content(14, 664.0, 646.0));
+    assert!(!stale.content_matches_surface());
+
+    let fractional_scale_match =
+        PresentMapping::top_left_clip(drawable(1102, 761, 1.5), content(15, 735.0, 507.0));
+    assert!(fractional_scale_match.content_matches_surface());
+
+    let integer_scale_match =
+        PresentMapping::top_left_clip(drawable(1101, 761, 2.0), content(16, 551.0, 381.0));
+    assert!(integer_scale_match.content_matches_surface());
+
+    let one_logical_pixel_stale =
+        PresentMapping::top_left_clip(drawable(1100, 760, 1.0), content(17, 1099.0, 760.0));
+    assert!(!one_logical_pixel_stale.content_matches_surface());
+
+    let fractional_scale_stale =
+        PresentMapping::top_left_clip(drawable(1100, 760, 1.25), content(18, 879.0, 608.0));
+    assert!(!fractional_scale_stale.content_matches_surface());
+}

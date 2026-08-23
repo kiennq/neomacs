@@ -735,6 +735,9 @@ fn run_oracle_eval_with_sandbox(
     let mem_limit = oracle_mem_limit_bytes();
     let mut cmd = Command::new(&oracle_bin);
     sandbox.configure(&mut cmd);
+    cmd.envs(neomacs_parity_reference::uninstalled_gnu_environment(
+        &oracle_bin,
+    ));
     cmd.env("EMACSNATIVELOADPATH", "/dev/null");
     eval_program.configure_command(&mut cmd);
 

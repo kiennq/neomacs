@@ -215,7 +215,7 @@ const BOTH_EDITORS_DECLARE_IT: &[BothEditorsDeclareItButTheDocTableCannotSeeIt] 
 /// `mapatoms` list of names whose `symbol-function` satisfies
 /// `subr-primitive-p` and subtracting one from the other.
 ///
-/// 23 xwidget names + `x-load-color-file` + 40 port names = 64.
+/// 23 xwidget names + `x-load-color-file` + 49 port names = 73.
 const DECLARED_HERE_AND_NOT_BY_THE_REFERENCE_GNU: &[DeclaredHere] = &[
     DeclaredHere {
         name: "delete-xwidget-view",
@@ -409,6 +409,44 @@ const DECLARED_HERE_AND_NOT_BY_THE_REFERENCE_GNU: &[DeclaredHere] = &[
         name: "neomacs-tls-available-p",
         why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
     },
+    // Fork-only video primitives declared in
+    // crates/neovm-core/src/emacs_core/display/video/subrs.rs.
+    DeclaredHere {
+        name: "neomacs-video-begin-measurement-epoch",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-destroy",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-diagnostics",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-load",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-p",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-pause",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-play",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-set-loop",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-video-stop",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
     DeclaredHere {
         name: "neovm--internal-panic",
         why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
@@ -595,7 +633,7 @@ fn port_namespace_rows_really_are_in_the_ports_namespace() {
     }
     assert!(
         !DECLARED_HERE_AND_NOT_BY_THE_REFERENCE_GNU.is_empty(),
-        "the table is empty; this build declares 40 primitives of its own, so an \
+        "the table is empty; this build declares 49 primitives of its own, so an \
          empty table is a deleted table rather than a clean one"
     );
 }

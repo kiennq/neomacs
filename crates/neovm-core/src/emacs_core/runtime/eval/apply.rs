@@ -1268,7 +1268,7 @@ impl Context {
             "the unchecked bytecode pop was handed a frame owing a debugger entry"
         );
         let frame_word = frame.0;
-        debug_assert_eq!(
+        assert_eq!(
             self.specpdl.len(),
             frame.base() + 1,
             "fast bytecode pop requires its frame to remain the specpdl top"

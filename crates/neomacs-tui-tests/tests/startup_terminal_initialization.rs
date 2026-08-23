@@ -21,6 +21,7 @@
 //! without an XTVERSION reply, so the auto-enable never fires there and the same
 //! startup succeeded even while alacritty failed.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -53,13 +54,16 @@ const PROBE_EL: &str = r##"
 struct Editor {
     name: &'static str,
     program: PathBuf,
+    environment: Vec<(OsString, OsString)>,
     extra_args: Vec<String>,
 }
 
 fn gnu() -> Editor {
+    let (program, environment) = neomacs_tui_tests::gnu_emacs_program();
     Editor {
         name: "GNU",
-        program: PathBuf::from("emacs"),
+        program: PathBuf::from(program),
+        environment,
         extra_args: vec![
             "-no-comp-spawn".to_string(),
             "--eval=(progn(set'native-comp-jit-compilation())(set'native-comp-async-report-warnings-errors'silent))".to_string(),
@@ -77,6 +81,7 @@ fn neomacs() -> Editor {
     Editor {
         name: "Neomacs",
         program,
+        environment: Vec::new(),
         extra_args: Vec::new(),
     }
 }
@@ -107,6 +112,7 @@ fn run_startup(editor: &Editor, term: &str, budget: Duration) -> Startup {
     for arg in &editor.extra_args {
         launch = launch.arg(arg);
     }
+    launch = launch.envs(editor.environment.iter().cloned());
     launch = launch
         .arg("-l")
         .arg(&script)
