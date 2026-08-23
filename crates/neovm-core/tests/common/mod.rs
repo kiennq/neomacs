@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 use neovm_core::emacs_core::format_eval_result_with_eval;
@@ -93,12 +95,20 @@ fn write_temp_elisp_file(
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 pub fn run_oracle_eval(form: &str) -> Result<String, String> {
-    let Some(oracle_bin) = oracle_emacs_path() else {
-        return Err("GNU Emacs oracle binary not found".to_string());
-    };
+    #[cfg(not(unix))]
+    {
+        let _ = form;
+        Err("GNU Emacs oracle execution is only supported on Unix".to_string())
+    }
 
-    let form_path = write_temp_elisp_file("neovm-oracle-form-", ".el", form)?;
-    let program = r#"(condition-case err
+    #[cfg(unix)]
+    {
+        let Some(oracle_bin) = oracle_emacs_path() else {
+            return Err("GNU Emacs oracle binary not found".to_string());
+        };
+
+        let form_path = write_temp_elisp_file("neovm-oracle-form-", ".el", form)?;
+        let program = r#"(condition-case err
     (let ((source-buf (generate-new-buffer " *neovm-oracle-form*"))
           (last nil))
       (unwind-protect
@@ -116,51 +126,52 @@ pub fn run_oracle_eval(form: &str) -> Result<String, String> {
   (error
    (princ (concat "ERR " (prin1-to-string err)))))"#;
 
-    let mem_limit_mb = std::env::var("NEOVM_ORACLE_MEM_LIMIT_MB")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(500);
-    let mem_limit_bytes = mem_limit_mb * 1024 * 1024;
+        let mem_limit_mb = std::env::var("NEOVM_ORACLE_MEM_LIMIT_MB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(500);
+        let mem_limit_bytes = mem_limit_mb * 1024 * 1024;
 
-    let mut cmd = Command::new(oracle_bin);
-    cmd.env("NEOVM_ORACLE_FORM_FILE", form_path.as_os_str())
-        .env("EMACSNATIVELOADPATH", "/dev/null")
-        .args([
-            "--batch",
-            "-Q",
-            "--eval",
-            "(setq native-comp-jit-compilation nil inhibit-automatic-native-compilation t native-comp-enable-subr-trampolines nil)",
-            "--eval",
-            program,
-        ]);
+        let mut cmd = Command::new(oracle_bin);
+        cmd.env("NEOVM_ORACLE_FORM_FILE", form_path.as_os_str())
+            .env("EMACSNATIVELOADPATH", "/dev/null")
+            .args([
+                "--batch",
+                "-Q",
+                "--eval",
+                "(setq native-comp-jit-compilation nil inhibit-automatic-native-compilation t native-comp-enable-subr-trampolines nil)",
+                "--eval",
+                program,
+            ]);
 
-    unsafe {
-        cmd.pre_exec(move || {
-            let rlim = libc::rlimit {
-                rlim_cur: mem_limit_bytes as libc::rlim_t,
-                rlim_max: mem_limit_bytes as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &rlim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        unsafe {
+            cmd.pre_exec(move || {
+                let rlim = libc::rlimit {
+                    rlim_cur: mem_limit_bytes as libc::rlim_t,
+                    rlim_max: mem_limit_bytes as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &rlim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run GNU Emacs oracle: {e}"))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "GNU Emacs oracle failed: status={}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run GNU Emacs oracle: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "GNU Emacs oracle failed: status={}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up

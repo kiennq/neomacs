@@ -3,6 +3,8 @@ use super::frame_layout::{
     install_tty_redisplay_callback as maybe_install_tty_redisplay_callback,
 };
 use super::image_catalog::{AsyncImageCatalog, wait_for_image_metadata};
+#[cfg(windows)]
+use super::log_target_for;
 use super::tty_frontend::{TtyPopupDisplayHost, TtyTerminalHost};
 use super::tty_init::{
     default_controlling_tty_name, detect_tty_background_mode, should_enable_live_tty_io,
@@ -1653,6 +1655,19 @@ fn runtime_mode_binary_names_match_gnu_shaped_roles() {
     assert_eq!(RuntimeMode::Raw.binary_name(), "neomacs-temacs");
     assert_eq!(RuntimeMode::BootstrapUse.binary_name(), "bootstrap-neomacs");
     assert_eq!(RuntimeMode::FinalRun.binary_name(), "neomacs");
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_gui_logging_is_opt_in_with_rust_log() {
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, false),
+        neovm_core::logging::LogTarget::File
+    );
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, true),
+        neovm_core::logging::LogTarget::Stdout
+    );
 }
 
 #[test]

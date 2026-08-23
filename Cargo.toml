@@ -324,8 +324,8 @@ colored = "3"
 wait-timeout = "0.2"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 4
 debug = false
 strip = "debuginfo"
 
@@ -356,6 +356,10 @@ debug-assertions = false
 overflow-checks = false
 codegen-units = 16
 incremental = false
+
+[profile.dev-release]
+inherits = "dev"
+opt-level = 2
 
 # Optimized build driven by a PGO profile. Same codegen settings as release,
 # but cargo gives it its own target/release-pgo directory, so a PGO build never

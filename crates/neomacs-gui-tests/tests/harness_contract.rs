@@ -184,20 +184,36 @@ fn linux_x11_plan_sets_backend_and_readback_environment() {
         Some("1")
     );
     assert_eq!(
-        command.env_value("NEOMACS_DEBUG_SURFACE_READBACK_PNG"),
-        Some("/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.png")
+        command
+            .env_value("NEOMACS_DEBUG_SURFACE_READBACK_PNG")
+            .map(PathBuf::from),
+        Some(PathBuf::from(
+            "/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.png"
+        ))
     );
     assert_eq!(
-        command.env_value("NEOMACS_GUI_FRAME_SNAPSHOT_JSON"),
-        Some("/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.frame-snapshot.json")
+        command
+            .env_value("NEOMACS_GUI_FRAME_SNAPSHOT_JSON")
+            .map(PathBuf::from),
+        Some(PathBuf::from(
+            "/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.frame-snapshot.json"
+        ))
     );
     assert_eq!(
-        command.env_value("NEOMACS_GUI_FRAME_SNAPSHOT_TXT"),
-        Some("/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.frame-snapshot.txt")
+        command
+            .env_value("NEOMACS_GUI_FRAME_SNAPSHOT_TXT")
+            .map(PathBuf::from),
+        Some(PathBuf::from(
+            "/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.frame-snapshot.txt"
+        ))
     );
     assert_eq!(
-        command.env_value("NEOMACS_GUI_FONT_SELECTION_RESULT"),
-        Some("/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.neomacs-result.el")
+        command
+            .env_value("NEOMACS_GUI_FONT_SELECTION_RESULT")
+            .map(PathBuf::from),
+        Some(PathBuf::from(
+            "/repo/target/neomacs-gui-tests/linux-x11/startup-smoke.neomacs-result.el"
+        ))
     );
 }
 
@@ -347,18 +363,23 @@ fn test_plan_materializes_json_manifest_artifact() {
 
     let written = plan.write_manifest().expect("manifest should be written");
     let manifest = std::fs::read_to_string(&written.json).expect("manifest should be readable");
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&manifest).expect("manifest should be valid JSON");
 
     assert_eq!(written.json, artifacts.json);
     assert!(!written.png.exists());
     assert!(manifest.contains(r##""status":"planned""##));
     assert!(manifest.contains(r##""backend":"linux-wayland""##));
     assert!(manifest.contains(r##""runner":"weston-headless""##));
-    assert!(manifest.contains(&format!(
-        r##""program":"{}""##,
-        workspace_root.join("target/release/neomacs").display()
-    )));
+    assert_eq!(
+        manifest_json["command"]["program"].as_str(),
+        workspace_root.join("target/release/neomacs").to_str()
+    );
     assert!(manifest.contains(r##""expected_artifacts":"##));
-    assert!(manifest.contains(&format!(r##""png":"{}""##, artifacts.png.display())));
+    assert_eq!(
+        manifest_json["expected_artifacts"]["png"].as_str(),
+        artifacts.png.to_str()
+    );
 }
 
 #[test]
