@@ -9,7 +9,7 @@ name: Windows upgrade contract (fast)
 on:
   push:
     paths:
-      - .github/workflows/windows-upgrade-contract.yml
+      - .github/workflows/windows-upgrade-contract.yml.disable
       - assets/windows-installer.nsi
       - scripts/compile-windows-installer.sh
       - scripts/generate-nsis-uninstall-include.sh

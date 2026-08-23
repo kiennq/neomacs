@@ -1,9 +1,12 @@
+#[cfg(target_os = "linux")]
 use super::{
-    RawX11DisplayObservation, SelectedLinuxBackend, WindowCoordinateSystem, classify_x_server,
-    coordinate_system_for_observation, observe_linux_backend, query_x11_display_with_timeout,
+    RawX11DisplayObservation, SelectedLinuxBackend, classify_x_server, observe_linux_backend,
+    query_x11_display_with_timeout,
 };
+use super::{WindowCoordinateSystem, coordinate_system_for_observation};
 use neomacs_display_protocol::{DisplayObservation, X11DisplayObservation, XServerKind};
 
+#[cfg(target_os = "linux")]
 #[test]
 fn xwayland_extension_is_the_authoritative_server_identity() {
     assert_eq!(
@@ -12,6 +15,7 @@ fn xwayland_extension_is_the_authoritative_server_identity() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn xorg_vendor_is_classified_only_when_xwayland_extension_is_absent() {
     assert_eq!(
@@ -24,6 +28,7 @@ fn xorg_vendor_is_classified_only_when_xwayland_extension_is_absent() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn x11_adapter_validates_untrusted_resource_and_geometry_values() {
     let observation = RawX11DisplayObservation {
@@ -40,6 +45,7 @@ fn x11_adapter_validates_untrusted_resource_and_geometry_values() {
     assert_eq!(observation.geometry(), None);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn x11_adapter_preserves_valid_raw_facts_without_applying_policy() {
     let observation = RawX11DisplayObservation {
@@ -58,6 +64,7 @@ fn x11_adapter_preserves_valid_raw_facts_without_applying_policy() {
     assert_eq!(geometry.height_mm(), 800);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn selected_x11_backend_carries_the_probe_result_into_the_observation() {
     let xwayland = X11DisplayObservation::new(XServerKind::Xwayland, None, None);
@@ -67,6 +74,7 @@ fn selected_x11_backend_carries_the_probe_result_into_the_observation() {
     assert_eq!(observation, DisplayObservation::X11(xwayland));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn selected_wayland_backend_does_not_probe_x11() {
     let observation = observe_linux_backend(SelectedLinuxBackend::Wayland, || {
@@ -76,6 +84,7 @@ fn selected_wayland_backend_does_not_probe_x11() {
     assert_eq!(observation, DisplayObservation::Wayland);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn slow_x11_probe_has_a_bounded_fallback() {
     let observation = query_x11_display_with_timeout(std::time::Duration::ZERO, || {

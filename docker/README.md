@@ -1,13 +1,6 @@
 # Ubuntu 22.04 build environment
 
-This directory contains two deliberately separate images:
-
-- `Dockerfile.ubuntu-22.04` is a compiler-equipped source-build environment.
-- `Dockerfile.runtime` is the non-root application image published from an
-  already-built, verified release tarball.
-
-See [the Docker user guide](../docs/docker.md) for the published image, tags,
-runtime examples, and the local runtime-image build procedure.
+`Dockerfile.ubuntu-22.04` is a compiler-equipped source-build environment.
 
 ## Source-build environment
 
