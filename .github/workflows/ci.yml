@@ -116,28 +116,28 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            C:\gstreamer
-            C:\gstreamer-msi-cache
-          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v1
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v3
 
-      - name: Install GStreamer SDK
-        if: runner.os == 'Windows' && steps.cache-gstreamer.outputs.cache-hit != 'true'
-        shell: powershell
+      - name: Install and configure GStreamer SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: ./scripts/setup-windows-gstreamer.ps1 -Install
 
+      - name: Run Windows GStreamer setup contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-gstreamer-setup.ps1
+
       - name: Save GStreamer SDK cache
-        if: runner.os == 'Windows' && steps.cache-gstreamer.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.cache-gstreamer.outputs.cache-hit != 'true' && hashFiles('PFiles64/gstreamer/1.0/msvc_x86_64/bin/pkg-config.exe') != '' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            C:\gstreamer
-            C:\gstreamer-msi-cache
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
           key: ${{ steps.cache-gstreamer.outputs.cache-primary-key }}
-
-      - name: Configure GStreamer SDK
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: ./scripts/setup-windows-gstreamer.ps1
 
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
@@ -152,14 +152,14 @@ jobs:
 
       - name: cargo check workspace (Unix)
         if: runner.os != 'Windows'
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
       - name: cargo check workspace (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           source scripts/windows-gstreamer-env.sh
-          cargo check --workspace
+          cargo check --workspace --locked
 
   neomacs-workspace-test-archive:
     name: workspace test archive (linux x86_64)
@@ -170,9 +170,11 @@ jobs:
       RUST_BACKTRACE: 1
       # A release workspace test archive links several large test binaries.
       # Bound compiler and linker parallelism to fit GitHub's hosted runner.
-      CARGO_BUILD_JOBS: "1"
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--threads=1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--threads=2"
       TMPDIR: ${{ github.workspace }}/tmp
     steps:
       - *checkout
@@ -190,6 +192,7 @@ jobs:
       - name: Build and archive workspace tests
         run: |
           cargo nextest archive \
+            --locked \
             --release \
             --workspace \
             --archive-file neomacs-workspace-tests.tar.zst
@@ -371,6 +374,7 @@ jobs:
 
       - name: Run deterministic package ecosystem compatibility tests
         run: |
+          # shellcheck disable=SC2086
           cargo nextest run \
             --archive-file neomacs-workspace-tests.tar.zst \
             --extract-to "$TMPDIR/nextest" \
