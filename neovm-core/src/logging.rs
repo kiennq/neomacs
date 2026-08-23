@@ -37,8 +37,8 @@ pub enum LogTarget {
     /// Write to stdout.
     ///
     /// Used by:
-    /// - the GUI binary (`neomacs` under `Gui` frontend), where stdout
-    ///   is captured to a log file by convention (`> /tmp/neomacs.log 2>&1`);
+    /// - the GUI binary on non-Windows platforms, and on Windows when
+    ///   `RUST_LOG` explicitly opts into console tracing;
     /// - build-time utilities (`neomacs-temacs`, `bootstrap-neomacs`),
     ///   whose stdout is captured by the `xtask` driver and surfaced
     ///   in build logs.
@@ -49,7 +49,8 @@ pub enum LogTarget {
     ///
     /// Used by the TUI binary (`neomacs -nw` / `--batch` for user-
     /// interactive runs) where writing to stdout or stderr would
-    /// corrupt the alt-screen the redisplay engine is drawing into.
+    /// corrupt the alt-screen the redisplay engine is drawing into,
+    /// and by Windows GUI runs unless `RUST_LOG` requests console tracing.
     ///
     /// When `NEOMACS_LOG_FILE` is not set, the TUI runs silently (no
     /// file output). Set `NEOMACS_LOG_FILE=<path>` to opt in to file
