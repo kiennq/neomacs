@@ -113,15 +113,9 @@ Prefer system packages? Download them from
 
 | Platform | Packages |
 |----------|----------|
-| **Linux** | AppImage · `.deb` · `.rpm` · tarball (x86_64, aarch64) |
-| **macOS** *(experimental)* | `.dmg` · `.zip` · `.tar.gz` (Apple Silicon) |
-| **Windows** *(experimental)* | installer `.exe` · portable `.zip` (x86_64, aarch64) |
-
-For terminal, batch, and Linux container deployments, the complete application
-is also published for amd64 and arm64 on
-[`evalexec/neomacs`](https://hub.docker.com/r/evalexec/neomacs) and
-[`ghcr.io/eval-exec/neomacs`](https://github.com/eval-exec/neomacs/pkgs/container/neomacs).
-See the [Docker guide](docs/docker.md).
+| **Linux x86_64** | `.deb` |
+| **Linux aarch64** | `.tar.gz` |
+| **Windows** *(experimental)* | portable `.zip` (x86_64, aarch64) |
 
 <details>
 <summary><b>Build from source</b></summary>

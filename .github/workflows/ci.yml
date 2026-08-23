@@ -32,25 +32,19 @@ jobs:
       - name: Run actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
 
+      - name: Test release workflow contract
+        run: python scripts/test-release-workflow.py
+
       - name: Lint release shell contracts
         run: |
           shellcheck \
-            install.sh \
-            scripts/prepare-docker-runtime-context.sh \
-            scripts/test-docker-runtime-context.sh \
             scripts/lib/macos-macho.sh \
             scripts/vendor-macos-runtime.sh \
             scripts/test-macos-dependency-closure.sh
-          sh -n install.sh
           bash -n \
-            scripts/prepare-docker-runtime-context.sh \
-            scripts/test-docker-runtime-context.sh \
             scripts/lib/macos-macho.sh \
             scripts/vendor-macos-runtime.sh \
             scripts/test-macos-dependency-closure.sh
-
-      - name: Test Docker runtime context contract
-        run: ./scripts/test-docker-runtime-context.sh
 
       # The dependency closure is pure path logic over otool output, so it is
       # testable with stub tools on Linux.  Running it here means a regression
@@ -130,6 +124,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      GSTREAMER_VERSION: 1.26.9
     steps:
       - *checkout
 
@@ -141,6 +136,34 @@ jobs:
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
         run: brew install pkg-config
+      - name: Restore GStreamer SDK cache
+        if: runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64'
+        id: cache-gstreamer
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v3
+
+      - name: Install and configure GStreamer SDK
+        if: runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64'
+        shell: pwsh
+        run: ./scripts/setup-windows-gstreamer.ps1 -Install
+
+      - name: Run Windows GStreamer setup contract
+        if: runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64'
+        shell: pwsh
+        run: ./scripts/test-windows-gstreamer-setup.ps1
+
+      - name: Save GStreamer SDK cache
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.label == 'windows-msvc-x86_64' && steps.cache-gstreamer.outputs.cache-hit != 'true' && hashFiles('PFiles64/gstreamer/1.0/msvc_x86_64/bin/pkg-config.exe') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: ${{ steps.cache-gstreamer.outputs.cache-primary-key }}
 
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
@@ -158,6 +181,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          if [ "${{ matrix.label }}" = "windows-msvc-x86_64" ]; then
+            source scripts/windows-gstreamer-env.sh
+          fi
           cargo check --workspace
 
       - name: cargo check minimal capability build
@@ -338,76 +364,6 @@ jobs:
       # safe point, which turns "sometimes" into "always".
       - name: GC-stress the shipped runtime
         run: cargo xtask gc-stress
-
-      # Exercise install.sh end-to-end against a release-shaped tree built
-      # from THIS commit (file:// download base), so the curl|bash path --
-      # download, checksum, versioned install, symlink chain, runtime-root
-      # resolution with no environment variables -- is proven before any
-      # release publishes it.
-      #
-      # BOTH tarball shapes are staged, because install.sh has a branch for
-      # each and a release that only exercises one of them ships the other
-      # untested: the current layout, whose dump sits in the archlib
-      # (libexec/neomacs/<version>/<triple>, GNU's archlibdir), and the
-      # pre-0.0.16 layout, whose dump sits in bin/ -- which --tag still has to
-      # be able to install.
-      - name: Verify install.sh against a staged release tree
-        run: |
-          set -eux
-          triple=x86_64-unknown-linux-gnu
-          crate_version="$(
-            awk '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0}
-                 s && /^version[[:space:]]*=/{gsub(/^version[[:space:]]*=[[:space:]]*"/,"");gsub(/".*$/,"");print;exit}' \
-              Cargo.toml
-          )"
-          archlib="libexec/neomacs/$crate_version/$triple"
-
-          stage_release() {
-            local version="$1" layout="$2"
-            local stage_root="$TMPDIR/install-release-$layout"
-            local staged="$stage_root/v$version"
-            local pkg_parent="$stage_root/pkg"
-            local pkg="$pkg_parent/neomacs-$version-$triple"
-            rm -rf "$stage_root"
-            mkdir -p "$staged" "$pkg/bin" "$pkg/share/neomacs"
-            cp target/release/neomacs target/release/neomacsclient "$pkg/bin/"
-            if [ "$layout" = archlib ]; then
-              mkdir -p "$pkg/$archlib"
-              cp target/release/neomacs.pdump "$pkg/$archlib/neomacs.pdump"
-            else
-              cp target/release/neomacs.pdump "$pkg/bin/neomacs.pdump"
-            fi
-            cp -r lisp etc "$pkg/share/neomacs/"
-            tar czf "$staged/neomacs-$version-$triple.tar.gz" \
-              -C "$pkg_parent" "neomacs-$version-$triple"
-            ( cd "$staged" && sha256sum "neomacs-$version-$triple.tar.gz" > SHA256SUMS )
-            local prefix="$stage_root/prefix"
-            NEOMACS_DOWNLOAD_BASE="file://$stage_root" \
-              sh install.sh --tag "v$version" --prefix "$prefix"
-            test -x "$prefix/bin/neomacs"
-            test "$(readlink "$prefix/share/neomacs/current")" = "versions/$version"
-            test "$(readlink "$prefix/bin/neomacs")" = "../share/neomacs/current/bin/neomacs"
-            local exe ver_dir
-            exe="$(readlink -f "$prefix/bin/neomacs")"
-            ver_dir="$(dirname "$(dirname "$exe")")"
-            if [ "$layout" = archlib ]; then
-              test -f "$ver_dir/$archlib/neomacs.pdump"
-              test ! -f "$(dirname "$exe")/neomacs.pdump"
-              # exec-directory is PATH_EXEC (GNU src/callproc.c:1961), so the
-              # installed tree has to answer with its own archlib.
-              env -u NEOMACS_RUNTIME_ROOT -u EMACSPATH \
-                "$prefix/bin/neomacs" --batch \
-                --eval "(princ exec-directory)" | grep -Fx "$ver_dir/$archlib/"
-            else
-              test -f "$(dirname "$exe")/neomacs.pdump"
-            fi
-            test -d "$ver_dir/share/neomacs/lisp"
-            env -u NEOMACS_RUNTIME_ROOT \
-              "$prefix/bin/neomacs" --batch --eval '(princ (emacs-version))'
-          }
-
-          stage_release citest archlib
-          stage_release citestlegacy legacy
 
       - name: Package shared test runtime
         run: |

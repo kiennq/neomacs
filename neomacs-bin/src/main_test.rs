@@ -14,8 +14,8 @@ use super::{
     bootstrap_default_font_name, bootstrap_display_config, bootstrap_frame_metrics,
     bootstrap_frame_metrics_for_font_sizing, bootstrap_frame_metrics_for_frontend,
     classify_early_cli_action, configure_gnu_startup_state, gui_display_identity,
-    load_neomacs_gui_term_layer, parse_startup_options, publish_gui_frame, raw_loadup_command_line,
-    raw_loadup_startup_surface, render_fingerprint_text, render_help_text,
+    load_neomacs_gui_term_layer, log_target_for, parse_startup_options, publish_gui_frame,
+    raw_loadup_command_line, raw_loadup_startup_surface, render_fingerprint_text, render_help_text,
     render_startup_image_error, render_version_text, run_gnu_startup,
     runtime_mode_from_program_name, startup_dimensions, sync_live_gui_frame_titles,
     sync_selected_gui_chrome_state,
@@ -1603,6 +1603,19 @@ fn runtime_mode_binary_names_match_gnu_shaped_roles() {
     assert_eq!(RuntimeMode::Raw.binary_name(), "neomacs-temacs");
     assert_eq!(RuntimeMode::BootstrapUse.binary_name(), "bootstrap-neomacs");
     assert_eq!(RuntimeMode::FinalRun.binary_name(), "neomacs");
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_gui_logging_is_opt_in_with_rust_log() {
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, false),
+        neovm_core::logging::LogTarget::File
+    );
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, true),
+        neovm_core::logging::LogTarget::Stdout
+    );
 }
 
 #[test]

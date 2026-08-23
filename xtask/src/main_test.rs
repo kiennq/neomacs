@@ -127,6 +127,116 @@ fn linux_release_keeps_gstreamer_in_an_optional_archlib_plugin() {
 }
 
 #[test]
+fn release_workflow_uses_approved_linux_packagers() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    let job = github_workflow_job(workflow, "build-linux");
+
+    assert!(job.contains("./scripts/package-deb.sh"));
+    assert!(job.contains("./scripts/package-release.sh"));
+    assert!(!job.contains("./scripts/package-appimage.sh"));
+    assert!(!job.contains("./scripts/package-rpm.sh"));
+}
+
+#[test]
+fn release_workflow_uses_workspace_versioned_manual_releases() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    let prepare = github_workflow_job(workflow, "prepare-release");
+
+    assert!(prepare.contains("cargo metadata --no-deps --format-version 1"));
+    assert!(prepare.contains("select(.name == \"neomacs\") | .version"));
+    assert!(prepare.contains("version=\"${base_version}.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:7}\""));
+    assert!(prepare.contains("tag=\"v$version\""));
+    assert!(prepare.contains("version=$version"));
+    assert!(prepare.contains("tag=$tag"));
+    assert!(prepare.contains("prerelease=$prerelease"));
+    assert!(prepare.contains("make_latest=$make_latest"));
+    assert!(prepare.contains("git push origin \"refs/tags/$tag\""));
+    assert!(prepare.contains("prerelease: ${{ steps.metadata.outputs.prerelease }}"));
+    assert!(prepare.contains("make_latest: ${{ steps.metadata.outputs.make_latest }}"));
+    assert!(!prepare.contains("target_commitish"));
+    assert!(!prepare.contains("discussion_category_name"));
+    assert!(!prepare.contains("0.0.0"));
+    assert!(!prepare.contains("prerelease=true"));
+    assert!(!prepare.contains("make_latest=false"));
+}
+
+#[test]
+fn release_workflow_verifies_synthetic_tag_before_reusing_it() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    let prepare = github_workflow_job(workflow, "prepare-release");
+
+    assert!(
+        prepare.contains("git rev-parse --verify \"${tag}^{commit}\""),
+        "unverified rev-parse echoes a missing tag and makes it look like a conflicting tag"
+    );
+}
+
+#[test]
+fn release_workflow_uploads_each_platform_without_a_build_barrier() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    assert!(!workflow.contains("create-release:"));
+    assert!(!workflow.contains("actions/upload-artifact@"));
+    assert!(!workflow.contains("actions/download-artifact@"));
+
+    for job_name in ["build-linux", "build-windows"] {
+        let job = github_workflow_job(workflow, job_name);
+        assert!(job.contains("needs: prepare-release"));
+        assert!(job.contains("softprops/action-gh-release@"));
+        assert!(job.contains("tag_name: ${{ needs.prepare-release.outputs.tag }}"));
+    }
+}
+
+#[test]
+fn release_workflow_windows_uploads_only_the_portable_zip() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    let job = github_workflow_job(workflow, "build-windows");
+
+    assert!(job.contains("dist/*.zip"));
+    assert!(!job.contains("Install NSIS"));
+    assert!(!job.contains("Package .exe installer"));
+    assert!(!job.contains("Verify Windows installer ownership contract"));
+    assert!(!job.contains("dist/*.exe"));
+}
+
+#[test]
+fn release_workflow_caches_workspace_crates_per_flavor() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    for (job_name, cache_key) in [
+        ("build-linux", "release-linux-${{ matrix.arch }}"),
+        ("build-windows", "release-windows-msvc-${{ matrix.arch }}"),
+    ] {
+        let job = github_workflow_job(workflow, job_name);
+        assert!(job.contains(&format!("cache-key: {cache_key}")));
+        assert!(
+            job.contains("cache-workspace-crates: true"),
+            "{job_name} does not cache its workspace crates"
+        );
+    }
+}
+
+#[test]
+fn release_build_jobs_have_sufficient_timeouts() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    let linux = github_workflow_job(workflow, "build-linux");
+    assert!(linux.contains("timeout-minutes: 120"));
+
+    let windows = github_workflow_job(workflow, "build-windows");
+    assert!(windows.contains("timeout-minutes: 180"));
+}
+
+#[test]
+fn release_workflow_keeps_bootstrap_logging_quiet() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+
+    assert!(
+        !workflow.contains("RUST_LOG: info"),
+        "release bootstrap must not emit info-level tracing"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -201,6 +311,21 @@ fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
         .expect("reject unknown Linux CI profile");
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown profile: typo"));
+}
+
+#[test]
+fn release_profile_balances_optimization_and_build_parallelism() {
+    let workspace_manifest = include_str!("../../Cargo.toml");
+    let release_profile = workspace_manifest
+        .split_once("[profile.release]")
+        .expect("workspace must define a release profile")
+        .1
+        .split("\n[")
+        .next()
+        .unwrap();
+
+    assert!(release_profile.contains("lto = \"thin\""));
+    assert!(release_profile.contains("codegen-units = 4"));
 }
 
 #[test]
@@ -380,10 +505,35 @@ fn ci_lints_every_github_actions_workflow() {
 }
 
 #[test]
+fn ci_accelerates_workspace_check_and_test_archive_builds() {
+    let workflow = include_str!("../../.github/workflows/ci.yml");
+
+    let check = github_workflow_job(workflow, "check");
+    assert_eq!(
+        check.matches("cargo check --workspace --locked").count(),
+        2,
+        "Unix and Windows workspace checks must use the locked dependency graph"
+    );
+    let archive = github_workflow_job(workflow, "neomacs-workspace-test-archive");
+    assert!(archive.contains("cargo nextest archive \\\n            --locked \\\n"));
+    for setting in [
+        "CARGO_BUILD_JOBS: \"2\"",
+        "CARGO_PROFILE_RELEASE_LTO: \"thin\"",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL: \"1\"",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS: \"16\"",
+        "-C link-arg=-Wl,--threads=2",
+    ] {
+        assert!(archive.contains(setting), "archive is missing {setting}");
+    }
+}
+
+#[test]
 fn rust_ci_setup_uses_the_workspace_toolchain_and_owns_test_tooling() {
     let action = include_str!("../../.github/actions/setup-rust/action.yml");
 
     assert!(action.contains("cache-key:"));
+    assert!(action.contains("cache-workspace-crates:"));
+    assert!(action.contains("cache-workspace-crates: ${{ inputs.cache-workspace-crates }}"));
     assert!(action.contains("hashFiles('scripts/ci/setup-linux.sh'"));
     assert!(action.contains("install-nextest:"));
     assert!(action.contains("actions-rust-lang/setup-rust-toolchain@"));
@@ -399,16 +549,16 @@ fn rust_ci_setup_uses_the_workspace_toolchain_and_owns_test_tooling() {
 #[test]
 fn ci_pins_external_actions_and_enables_automated_updates() {
     let workflows = [
-        include_str!("../../.github/workflows/docker-release.yml"),
         include_str!("../../.github/workflows/nextest-shards.yml"),
         include_str!("../../.github/workflows/ci.yml"),
-        include_str!("../../.github/workflows/codeql.yml"),
-        include_str!("../../.github/workflows/linux.yml"),
-        include_str!("../../.github/workflows/nix-smoke.yml"),
+        include_str!("../../.github/workflows/codeql.yml.disable"),
+        include_str!("../../.github/workflows/linux.yml.disable"),
+        include_str!("../../.github/workflows/nix-smoke.yml.disable"),
         include_str!("../../.github/workflows/release.yml"),
-        include_str!("../../.github/workflows/tmp_mac_test.yml"),
-        include_str!("../../.github/workflows/window-oracle-nightly.yml"),
-        include_str!("../../.github/workflows/windows-installer.yml"),
+        include_str!("../../.github/workflows/sync.yml"),
+        include_str!("../../.github/workflows/tmp_mac_test.yml.disable"),
+        include_str!("../../.github/workflows/window-oracle-nightly.yml.disable"),
+        include_str!("../../.github/workflows/windows-installer.yml.disable"),
         include_str!("../../.github/actions/setup-rust/action.yml"),
     ];
 
@@ -445,29 +595,37 @@ fn ci_pins_external_actions_and_enables_automated_updates() {
 }
 
 #[test]
-fn docker_release_publishes_one_verified_image_to_docker_hub_and_ghcr() {
-    let workflow = include_str!("../../.github/workflows/docker-release.yml");
-    let manifest_job = github_workflow_job(workflow, "publish-manifest");
-    let release_workflow = include_str!("../../.github/workflows/release.yml");
-    let release_job = github_workflow_job(release_workflow, "publish-docker");
-    let docker_docs = include_str!("../../docs/docker.md");
+fn retired_release_consumers_stay_removed() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
 
-    assert!(workflow.contains("packages: write"));
-    assert!(workflow.contains("GHCR_IMAGE: ghcr.io/${{ github.repository }}"));
-    assert!(manifest_job.contains("name: container-release"));
-    assert!(
-        manifest_job
-            .contains("url: https://github.com/${{ github.repository }}/pkgs/container/neomacs")
-    );
-    assert!(manifest_job.contains("registry: ghcr.io"));
-    assert!(manifest_job.contains("password: ${{ secrets.GITHUB_TOKEN }}"));
-    assert!(manifest_job.contains("ghcr_exact_ref=\"$GHCR_IMAGE:$RELEASE_VERSION\""));
-    assert!(manifest_job.contains("docker buildx imagetools create"));
-    assert!(manifest_job.contains("\"$dockerhub_exact_ref\""));
-    assert!(manifest_job.contains("docker logout ghcr.io"));
-    assert!(release_job.contains("packages: write"));
-    assert!(docker_docs.contains("Registry pushes alone do not create GitHub Deployments"));
-    assert!(docker_docs.contains("anonymous registry read"));
+    for path in [
+        "install.sh",
+        ".github/workflows/docker-release.yml",
+        "docs/docker.md",
+        "docker/Dockerfile.runtime",
+        "scripts/prepare-docker-runtime-context.sh",
+        "scripts/test-docker-runtime-context.sh",
+    ] {
+        assert!(
+            !repo.join(path).exists(),
+            "retired release consumer exists: {path}"
+        );
+    }
+}
+
+#[test]
+fn sync_workflow_rebases_fork_main_every_twelve_hours() {
+    let workflow = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/sync.yml"),
+    )
+    .expect("sync workflow");
+
+    assert!(workflow.contains("cron: \"0 */12 * * *\""));
+    assert!(workflow.contains("upstream_repo: eval-exec/neomacs"));
+    assert!(workflow.contains("upstream_branch: main"));
+    assert!(workflow.contains("origin_branch: main"));
+    assert!(workflow.contains("git rebase --autosquash --autostash \"upstream/$upstream_branch\""));
+    assert!(workflow.contains("git push origin -f \"HEAD:$origin_branch\""));
 }
 
 #[test]
@@ -827,6 +985,30 @@ fn parse_release_uses_release_bin_dir() {
     let options = parse_options(&["--release"]);
     assert_eq!(options.profile, BuildProfile::Release);
     assert_eq!(options.bin_dir, PathBuf::from("/repo/target/release"));
+}
+
+#[test]
+fn parse_dev_skips_byte_compile_by_default() {
+    let options = parse_options(&["--profile", "dev"]);
+    assert_eq!(options.profile, BuildProfile::Dev);
+    assert_eq!(options.bin_dir, PathBuf::from("/repo/target/debug"));
+    assert!(options.no_byte_compile);
+}
+
+#[test]
+fn parse_dev_release_skips_byte_compile_by_default() {
+    let options = parse_options(&["--profile", "dev-release"]);
+    assert_eq!(options.profile, BuildProfile::DevRelease);
+    assert_eq!(options.bin_dir, PathBuf::from("/repo/target/dev-release"));
+    assert!(options.no_byte_compile);
+}
+
+#[test]
+fn parse_dev_preserves_no_byte_compile_flag() {
+    let options = parse_options(&["--profile", "dev", "--no-byte-compile"]);
+    assert_eq!(options.profile, BuildProfile::Dev);
+    assert_eq!(options.bin_dir, PathBuf::from("/repo/target/debug"));
+    assert!(options.no_byte_compile);
 }
 
 #[test]
@@ -1590,17 +1772,17 @@ fn compile_main_sources_follow_gnu_no_byte_compile_filter() {
 }
 
 #[test]
-fn compile_main_failure_summary_reports_failed_file_count() {
+fn compile_main_failure_summary_reports_failed_invocation_count() {
     assert_eq!(
         compile_main_failure_summary(&["/repo/lisp/simple.el".to_string()]),
-        "compile-main failed to byte-compile 1 file"
+        "compile-main failed in 1 compiler invocation"
     );
     assert_eq!(
         compile_main_failure_summary(&[
             "/repo/lisp/simple.el".to_string(),
             "/repo/lisp/calendar/calendar.el".to_string(),
         ]),
-        "compile-main failed to byte-compile 2 files"
+        "compile-main failed in 2 compiler invocations"
     );
 }
 
@@ -1689,6 +1871,17 @@ fn validate_primary_loaddefs_rejects_crlf_output_as_a_gnu_mismatch() {
 }
 
 #[test]
+fn normalize_lisp_line_endings_rewrites_crlf() {
+    let tempdir = tempdir();
+    let path = tempdir.join("loaddefs.el");
+    fs::write(&path, b"first\r\nsecond\r\n").unwrap();
+
+    normalize_lisp_line_endings(&path).unwrap();
+
+    assert_eq!(fs::read(&path).unwrap(), b"first\nsecond\n");
+}
+
+#[test]
 fn validate_primary_loaddefs_rejects_moved_docstring_layout() {
     let contents = "\
 ;;; loaddefs.el --- generated
@@ -1740,8 +1933,14 @@ fn compile_first_args_match_gnu_native_shape() {
 }
 
 #[test]
-fn compile_main_args_match_gnu_non_native_shape() {
-    let args = compile_main_args_for_source(false, Path::new("/tmp/simple.el"));
+fn compile_main_args_batch_non_native_sources_in_one_process() {
+    let args = compile_main_args_for_sources(
+        false,
+        &[
+            PathBuf::from("/tmp/simple.el"),
+            PathBuf::from("/tmp/calendar.el"),
+        ],
+    );
     assert_eq!(
         args,
         vec![
@@ -1755,13 +1954,14 @@ fn compile_main_args_match_gnu_non_native_shape() {
             OsString::from("-f"),
             OsString::from("batch-byte-compile"),
             OsString::from("/tmp/simple.el"),
+            OsString::from("/tmp/calendar.el"),
         ]
     );
 }
 
 #[test]
-fn compile_main_args_match_gnu_native_shape() {
-    let args = compile_main_args_for_source(true, Path::new("/tmp/simple.el"));
+fn compile_main_args_keep_native_source_single() {
+    let args = compile_main_args_for_sources(true, &[PathBuf::from("/tmp/simple.el")]);
     assert_eq!(
         args,
         vec![
@@ -1777,6 +1977,37 @@ fn compile_main_args_match_gnu_native_shape() {
             OsString::from("-f"),
             OsString::from("batch-byte+native-compile"),
             OsString::from("/tmp/simple.el"),
+        ]
+    );
+}
+
+#[test]
+fn compile_main_batches_cap_windows_command_size() {
+    let sources = (0..17)
+        .map(|index| PathBuf::from(format!("/tmp/file-{index}.el")))
+        .collect::<Vec<_>>();
+
+    let batches = compile_main_batches(false, sources);
+
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].len(), 16);
+    assert_eq!(batches[1], vec![PathBuf::from("/tmp/file-16.el")]);
+}
+
+#[test]
+fn compile_main_batches_keep_native_sources_isolated() {
+    let sources = (0..3)
+        .map(|index| PathBuf::from(format!("/tmp/file-{index}.el")))
+        .collect::<Vec<_>>();
+
+    let batches = compile_main_batches(true, sources);
+
+    assert_eq!(
+        batches,
+        vec![
+            vec![PathBuf::from("/tmp/file-0.el")],
+            vec![PathBuf::from("/tmp/file-1.el")],
+            vec![PathBuf::from("/tmp/file-2.el")],
         ]
     );
 }
@@ -2096,9 +2327,14 @@ fn executable_name_uses_platform_suffix() {
 fn cargo_program_uses_path_lookup() {
     let cargo = cargo_program();
     assert!(cargo.is_absolute(), "{}", cargo.display());
-    assert_eq!(
-        cargo.file_name().unwrap(),
-        executable_name("cargo").as_str()
+    assert!(
+        cargo
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&executable_name("cargo")),
+        "path lookup returned an unexpected cargo executable: {}",
+        cargo.display()
     );
 }
 
@@ -2110,9 +2346,15 @@ fn resolve_program_on_path_returns_absolute_path_from_path() {
     let cargo = bin.join(executable_name("cargo"));
     fs::write(&cargo, "").unwrap();
 
-    assert_eq!(
-        resolve_program_on_path("cargo", Some(bin.as_os_str()), Path::new("/unused")).unwrap(),
-        cargo
+    let resolved =
+        resolve_program_on_path("cargo", Some(bin.as_os_str()), Path::new("/unused")).unwrap();
+    assert!(
+        resolved
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&cargo.to_string_lossy()),
+        "path lookup returned {} instead of {}",
+        resolved.display(),
+        cargo.display()
     );
 }
 
@@ -2126,9 +2368,15 @@ fn resolve_program_on_path_uses_pathext_before_extensionless_files() {
     let gunzip_exe = bin.join("gunzip.exe");
     fs::write(&gunzip_exe, "").unwrap();
 
-    assert_eq!(
-        resolve_program_on_path("gunzip", Some(bin.as_os_str()), Path::new("/unused")).unwrap(),
-        gunzip_exe
+    let resolved =
+        resolve_program_on_path("gunzip", Some(bin.as_os_str()), Path::new("/unused")).unwrap();
+    assert!(
+        resolved
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&gunzip_exe.to_string_lossy()),
+        "PATHEXT lookup returned {} instead of {}",
+        resolved.display(),
+        gunzip_exe.display()
     );
 }
 

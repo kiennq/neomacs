@@ -187,9 +187,9 @@ mkdir -p "$app_bundle/Contents/Frameworks"
 
 # GNU splits its helper programs the same way (lib-src/Makefile.in): the
 # user-facing INSTALLABLES go to bindir, the private UTILITIES to archlibdir.
-# neomacsclient is our emacsclient, so it stays beside the main executable
-# where install.sh symlinks it onto $PATH; the build-internal binaries move
-# into the archlib, which is what `exec-directory' now names.
+# neomacsclient is our emacsclient, so it stays beside the main executable;
+# the build-internal binaries move into the archlib, which is what
+# `exec-directory' now names.
 for binary in neomacs neomacsclient; do
   if [[ -f "$release_dir/$binary" ]]; then
     install -m 0755 "$release_dir/$binary" "$macos_dir/$binary"

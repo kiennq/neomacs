@@ -11,8 +11,13 @@ on:
       - scripts/package-windows-installer.sh
       - scripts/package-windows-installer-upgrade-fixtures.sh
       - scripts/run-windows-installer-contract.ps1
+      - scripts/setup-windows-gstreamer.ps1
+      - scripts/test-windows-gstreamer-setup.ps1
       - scripts/test-windows-installer.ps1
       - scripts/test-windows-installer-upgrade.ps1
+      - scripts/vendor-windows-gstreamer-runtime.sh
+      - scripts/windows-gstreamer-env.sh
+      - scripts/windows-msi-arguments.ps1
       - xtask/**
   pull_request:
     paths:
@@ -24,8 +29,13 @@ on:
       - scripts/package-windows-installer.sh
       - scripts/package-windows-installer-upgrade-fixtures.sh
       - scripts/run-windows-installer-contract.ps1
+      - scripts/setup-windows-gstreamer.ps1
+      - scripts/test-windows-gstreamer-setup.ps1
       - scripts/test-windows-installer.ps1
       - scripts/test-windows-installer-upgrade.ps1
+      - scripts/vendor-windows-gstreamer-runtime.sh
+      - scripts/windows-gstreamer-env.sh
+      - scripts/windows-msi-arguments.ps1
       - xtask/**
   workflow_dispatch:
 
@@ -53,11 +63,41 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       RUST_LOG: info
+      GSTREAMER_VERSION: 1.26.9
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Restore GStreamer SDK cache
+        if: matrix.arch == 'x86_64'
+        id: cache-gstreamer
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: windows-gstreamer-msvc-x86_64-${{ env.GSTREAMER_VERSION }}-v3
+
+      - name: Install GStreamer SDK
+        if: matrix.arch == 'x86_64' && steps.cache-gstreamer.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./scripts/setup-windows-gstreamer.ps1 -Install
+
+      - name: Save GStreamer SDK cache
+        if: ${{ !cancelled() && matrix.arch == 'x86_64' && steps.cache-gstreamer.outputs.cache-hit != 'true' && hashFiles('PFiles64/gstreamer/1.0/msvc_x86_64/bin/pkg-config.exe') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}\PFiles64
+            ${{ github.workspace }}\gstreamer-msi-cache
+          key: ${{ steps.cache-gstreamer.outputs.cache-primary-key }}
+
+      - name: Configure GStreamer SDK
+        if: matrix.arch == 'x86_64'
+        shell: pwsh
+        run: ./scripts/setup-windows-gstreamer.ps1
 
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
@@ -75,6 +115,9 @@ jobs:
         shell: bash
         timeout-minutes: 150
         run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            source scripts/windows-gstreamer-env.sh
+          fi
           cargo xtask fresh-build --release
 
       - name: GUI smoke (launch, frame snapshot, PNG readback)
@@ -82,6 +125,9 @@ jobs:
         timeout-minutes: 10
         run: |
           set -x
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            source scripts/windows-gstreamer-env.sh
+          fi
           mkdir -p gui-artifacts
           export NEOMACS_GUI_FRAME_SNAPSHOT_JSON="$PWD/gui-artifacts/snapshot.json"
           export NEOMACS_GUI_FRAME_SNAPSHOT_TXT="$PWD/gui-artifacts/snapshot.txt"
@@ -116,6 +162,9 @@ jobs:
         shell: bash
         timeout-minutes: 20
         run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            source scripts/windows-gstreamer-env.sh
+          fi
           ./scripts/package-windows-installer.sh --skip-build --no-smoke
 
       - name: Verify Windows installer ownership contract
