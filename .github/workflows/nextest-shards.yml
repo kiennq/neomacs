@@ -82,24 +82,11 @@ jobs:
           test -n "$libfaketime_so"
           echo "NEOVM_LIBFAKETIME_SO=$libfaketime_so" >> "$GITHUB_ENV"
 
-      - name: Download shared test runtime
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Download shared test assets
+        uses: ./.github/actions/download-test-assets
         with:
-          name: neomacs-test-runtime-linux-x86_64
-          path: .
-
-      - name: Unpack shared test runtime
-        run: |
-          tar xzf neomacs-test-runtime-linux-x86_64.tar.gz
-          chmod +x target/release/neomacs
-          test -f lisp/international/charscript.el
-          test -f lisp/international/charprop.el
-
-      - name: Download workspace test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: neomacs-workspace-tests-nextest-archive-linux-x86_64
-          path: .
+          runtime: "true"
+          archive: "true"
 
       - name: Run nextest shard
         run: |

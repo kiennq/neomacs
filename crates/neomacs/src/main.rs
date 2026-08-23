@@ -237,6 +237,23 @@ impl RuntimeMode {
     }
 }
 
+fn log_target_for(
+    mode: RuntimeMode,
+    frontend: FrontendKind,
+    console_logging_requested: bool,
+) -> neovm_core::logging::LogTarget {
+    use neovm_core::logging::LogTarget;
+
+    match mode {
+        RuntimeMode::Raw | RuntimeMode::BootstrapUse => LogTarget::Stdout,
+        RuntimeMode::FinalRun => match frontend {
+            FrontendKind::Gui if cfg!(windows) && !console_logging_requested => LogTarget::File,
+            FrontendKind::Gui => LogTarget::Stdout,
+            FrontendKind::Tty => LogTarget::File,
+        },
+    }
+}
+
 fn runtime_mode_from_program_name(program: &str) -> RuntimeMode {
     let file_name = Path::new(program)
         .file_name()
@@ -3681,23 +3698,19 @@ pub fn run(mode: RuntimeMode) {
     //   stdout logging is safe and useful.
     //
     // - `neomacs` (RuntimeMode::FinalRun) is the user-facing binary.
-    //   Under a GUI frontend, stdout is captured to a file by the
-    //   calling shell (e.g. `> /tmp/neomacs-gui.log 2>&1`), so
-    //   LogTarget::Stdout is fine. Under a TTY frontend (`-nw`,
-    //   `--batch`), stdout is the alt-screen pty the redisplay
-    //   engine is drawing into, so LogTarget::File routes tracing
-    //   to a file instead.
+    //   Non-Windows GUI runs log to stdout. Windows GUI runs are
+    //   silent unless RUST_LOG explicitly opts into console logging
+    //   or NEOMACS_LOG_FILE opts into file logging. Under a TTY
+    //   frontend (`-nw`, `--batch`), stdout is the alt-screen pty the
+    //   redisplay engine is drawing into, so LogTarget::File routes
+    //   tracing to a file instead.
     //
     // In all cases `NEOMACS_LOG_FILE=<path>` overrides the file path
     // (and, for LogTarget::Stdout, also adds a file layer alongside
     // stdout).
-    let log_target = match mode {
-        RuntimeMode::Raw | RuntimeMode::BootstrapUse => neovm_core::logging::LogTarget::Stdout,
-        RuntimeMode::FinalRun => match startup.frontend {
-            FrontendKind::Gui => neovm_core::logging::LogTarget::Stdout,
-            FrontendKind::Tty => neovm_core::logging::LogTarget::File,
-        },
-    };
+    let console_logging_requested =
+        std::env::var_os("RUST_LOG").is_some_and(|value| !value.is_empty());
+    let log_target = log_target_for(mode, startup.frontend, console_logging_requested);
     let _logging_guard = neovm_core::logging::init(log_target);
 
     if mode == RuntimeMode::Raw
