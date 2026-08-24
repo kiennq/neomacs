@@ -2301,6 +2301,64 @@ fn recursive_edit_runs_top_level_before_outer_command_loop_reads_input() {
 }
 
 #[test]
+fn nested_recursive_edit_propagates_top_level_and_runs_unwind_cleanup() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    let scratch = ev.buffers.create_buffer("*nested-recursive-edit*");
+    ev.buffers.set_current(scratch);
+    let frame = ev.frames.create_frame("F1", 80, 24, scratch);
+    assert!(ev.frames.select_frame(frame), "test needs a selected frame");
+    let global_map = crate::emacs_core::keymap::make_sparse_list_keymap();
+    install_global_map_for_test(&mut ev, global_map);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    drop(tx);
+
+    ev.input_rx = Some(rx);
+    ev.command_loop.running = true;
+    // Simulate an already-active outer command loop. The recursive-edit
+    // below must not catch the top-level throw meant to unwind it.
+    ev.command_loop.recursive_depth = 1;
+    ev.eval_str(
+        r#"(progn
+             (setq neo-recursive-edit-cleanup nil)
+             (fset 'neo-throw-top-level
+                   (lambda () (interactive) (top-level)))
+             (fset 'command-execute
+                   (lambda (cmd &optional _record _keys _special)
+                     (funcall cmd))))"#,
+    )
+    .expect("install nested recursive-edit test command");
+    crate::emacs_core::keymap::list_keymap_define_seq(
+        global_map,
+        &[Value::fixnum('q' as i64)],
+        Value::symbol("neo-throw-top-level"),
+    )
+    .expect("define top-level test command");
+    ev.command_loop
+        .keyboard
+        .kboard
+        .unread_events
+        .push_back(Value::fixnum('q' as i64));
+
+    let result = ev.eval_str(
+        "(unwind-protect
+             (recursive-edit)
+           (setq neo-recursive-edit-cleanup t))",
+    );
+
+    assert!(matches!(
+        result,
+        Err(crate::emacs_core::error::EvalError::UncaughtThrow { tag, .. })
+            if tag == Value::symbol("top-level")
+    ));
+    assert_eq!(
+        ev.eval_symbol("neo-recursive-edit-cleanup")
+            .expect("read recursive-edit cleanup marker"),
+        Value::T
+    );
+}
+
+#[test]
 fn command_loop_runs_initial_post_command_hook_before_first_command() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();

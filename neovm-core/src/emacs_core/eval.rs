@@ -7005,21 +7005,24 @@ impl Context {
         }
     }
 
-    /// Inner command loop with top-level catch.
+    /// Inner command loop; only the outermost loop catches `top-level`.
     ///
     /// Mirrors GNU Emacs `command_loop()` (keyboard.c:1104).
-    /// Wraps command_loop_2 in a catch for 'top-level.
+    /// The outermost invocation wraps command_loop_2 in a catch for
+    /// 'top-level.
     #[tracing::instrument(skip_all)]
     fn command_loop_inner(&mut self) -> EvalResult {
         let outermost_command_loop =
             self.command_loop.recursive_depth == 1 && self.minibuffers.depth() == 0;
         loop {
-            // Catch 'top-level throws (from (top-level) function).
-            let top_level_tag = Value::symbol("top-level");
-            self.push_condition_frame(ConditionFrame::Catch {
-                tag: top_level_tag,
-                resume: ResumeTarget::CommandLoopTopLevel,
-            });
+            if outermost_command_loop {
+                // Catch 'top-level throws (from (top-level) function).
+                let top_level_tag = Value::symbol("top-level");
+                self.push_condition_frame(ConditionFrame::Catch {
+                    tag: top_level_tag,
+                    resume: ResumeTarget::CommandLoopTopLevel,
+                });
+            }
 
             // GNU keyboard.c command_loop():
             //   internal_catch (Qtop_level, top_level_1, Qnil);
@@ -7049,11 +7052,15 @@ impl Context {
                 self.command_loop_2(CommandLoopEntry::RecursiveEdit)
             };
 
-            self.pop_condition_frame();
+            if outermost_command_loop {
+                self.pop_condition_frame();
+            }
 
             match result {
                 // top-level throw → restart the loop
-                Err(Flow::Throw(ref thrown)) if thrown.tag.is_symbol_named("top-level") => {
+                Err(Flow::Throw(ref thrown))
+                    if outermost_command_loop && thrown.tag.is_symbol_named("top-level") =>
+                {
                     tracing::debug!("command_loop_inner: top-level throw, restarting loop");
                     continue;
                 }
