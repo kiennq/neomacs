@@ -471,10 +471,15 @@ impl RenderApp {
             // contribute to the aggregate rate because the cycle cannot change
             // their pixels. Color remains a function of elapsed presentation
             // time, not the number of ticks.
+            let cycle_frame = if self.cpu_adapter {
+                None
+            } else {
+                window_state.render.compositor.current_frame.as_ref()
+            };
             let cycle_action = Self::reconcile_cursor_color_cycle_demand(
                 &mut self.frame_coordinator,
                 id,
-                window_state.render.compositor.current_frame.as_ref(),
+                cycle_frame,
                 &self.effects,
                 max_rate,
                 window_state.render.cursor.blink_on,

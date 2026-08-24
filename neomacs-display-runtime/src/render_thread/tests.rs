@@ -1,7 +1,8 @@
 use super::RenderApp;
 use super::state::{
     DeviceRecoveryTarget, GuiChromeInteractionState, PrimaryGpuInitialization, RenderStartupMode,
-    device_recovery_target, primary_gpu_initialization_plan,
+    device_recovery_target, effective_visual_config, is_cpu_adapter, needs_offscreen_render,
+    primary_gpu_initialization_plan,
 };
 use crate::core::frame_glyphs::FrameGlyphBuffer;
 use crate::core::types::DisplayWindowId;
@@ -11,8 +12,8 @@ use crate::thread_comm::{
 };
 use neomacs_display_protocol::glyph_matrix::FrameDisplayState;
 use neomacs_display_protocol::{
-    Color, CursorStyle, DisplaySlotId, EffectsConfig, FrameRate, PhysCursor, PopupMenuItem,
-    SealedFramePresentation,
+    Color, CursorStyle, DisplaySlotId, EffectValue, EffectsConfig, FrameRate, PhysCursor,
+    PopupMenuItem, SealedFramePresentation, VisualConfig,
 };
 use neovm_core::window::GuiFrameGeometryHints;
 use std::collections::HashMap;
@@ -33,6 +34,76 @@ fn make_test_app() -> RenderApp {
         #[cfg(feature = "neo-term")]
         crate::terminal::new_shared_terminals(),
     )
+}
+
+#[test]
+fn only_cpu_device_type_selects_cpu_compatibility_mode() {
+    assert!(is_cpu_adapter(wgpu::DeviceType::Cpu));
+    for device_type in [
+        wgpu::DeviceType::Other,
+        wgpu::DeviceType::IntegratedGpu,
+        wgpu::DeviceType::DiscreteGpu,
+        wgpu::DeviceType::VirtualGpu,
+    ] {
+        assert!(!is_cpu_adapter(device_type));
+    }
+}
+
+#[test]
+fn cpu_effective_visual_config_disables_motion_transitions_and_effects() {
+    let mut requested = VisualConfig::default();
+    requested.cursor_motion.enabled = true;
+    requested.cursor_size_transition.enabled = true;
+    requested.crossfade_transition.enabled = true;
+    requested.scroll_transition.enabled = true;
+    requested.effects.cursor_glow.enabled = true;
+    requested.effects.bg_pattern.style = 1;
+    requested.effects.mode_line_separator.style = 1;
+    requested.effects.scroll_bar.width = 8;
+
+    let effective = effective_visual_config(&requested, true);
+
+    assert!(!effective.cursor_motion.enabled);
+    assert!(!effective.cursor_size_transition.enabled);
+    assert!(!effective.crossfade_transition.enabled);
+    assert!(!effective.scroll_transition.enabled);
+    for name in effective.effects.effect_names() {
+        for (property, value) in effective.effects.effect_values(&name).unwrap() {
+            if property == "enabled" {
+                assert_eq!(value, EffectValue::Bool(false), "{name} remained enabled");
+            }
+        }
+    }
+    assert_eq!(effective.effects.bg_pattern.style, 0);
+    assert_eq!(effective.effects.mode_line_separator.style, 0);
+    assert_eq!(effective.effects.scroll_bar.width, 0);
+    assert!(requested.cursor_motion.enabled);
+    assert!(requested.effects.cursor_glow.enabled);
+    assert_eq!(requested.effects.bg_pattern.style, 1);
+}
+
+#[test]
+fn hardware_effective_visual_config_preserves_user_settings() {
+    let mut requested = VisualConfig::default();
+    requested.cursor_motion.enabled = false;
+    requested.cursor_size_transition.enabled = true;
+    requested.crossfade_transition.enabled = false;
+    requested.scroll_transition.enabled = true;
+    requested.effects.cursor_glow.enabled = true;
+    requested.effects.bg_pattern.style = 2;
+    requested.effects.mode_line_separator.style = 1;
+    requested.effects.scroll_bar.width = 9;
+
+    assert_eq!(effective_visual_config(&requested, false), requested);
+}
+
+#[test]
+fn cpu_adapter_never_uses_offscreen_transition_rendering() {
+    let policy = neomacs_display_protocol::TransitionPolicy::default();
+
+    assert!(!needs_offscreen_render(policy, false, true));
+    assert!(!needs_offscreen_render(policy, true, true));
+    assert!(needs_offscreen_render(policy, false, false));
 }
 
 #[test]
