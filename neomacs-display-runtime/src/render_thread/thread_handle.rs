@@ -3,6 +3,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::bootstrap::{build_render_event_loop_any_thread, run_render_loop_with_event_loop};
+use super::state::RenderStartupMode;
 use super::{SharedImageMetadata, SharedMonitorInfo};
 use crate::thread_comm::RenderComms;
 
@@ -139,6 +140,7 @@ impl RenderThread {
                     image_metadata,
                     shared_monitors,
                     true,
+                    RenderStartupMode::ImmediatePrimary,
                     #[cfg(feature = "neo-term")]
                     shared_terminals,
                 ) {

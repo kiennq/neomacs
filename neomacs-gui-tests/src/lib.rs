@@ -483,6 +483,170 @@ impl GuiCommandRunner for ProcessGuiCommandRunner {
     }
 }
 
+/// A subprocess whose standard streams are captured in files owned by the
+/// test that spawned it.
+#[derive(Debug)]
+pub struct CapturedProcess {
+    child: std::sync::Mutex<Child>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl CapturedProcess {
+    pub fn spawn(
+        command: &mut Command,
+        artifact_root: impl AsRef<Path>,
+        label: &str,
+    ) -> io::Result<Self> {
+        let artifact_root = artifact_root.as_ref();
+        fs::create_dir_all(artifact_root)?;
+        let stdout_path = artifact_root.join(format!("{label}.stdout.log"));
+        let stderr_path = artifact_root.join(format!("{label}.stderr.log"));
+        let stdout = fs::File::create(&stdout_path)?;
+        let stderr = fs::File::create(&stderr_path)?;
+        let child = command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()?;
+        Ok(Self {
+            child: std::sync::Mutex::new(child),
+            stdout_path,
+            stderr_path,
+        })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.lock().expect("child mutex poisoned").id()
+    }
+
+    pub fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.lock().expect("child mutex poisoned").try_wait()
+    }
+
+    pub fn diagnostics(&self) -> String {
+        format!(
+            "stdout {}:\n{}\nstderr {}:\n{}",
+            self.stdout_path.display(),
+            read_log_tail(&self.stdout_path),
+            self.stderr_path.display(),
+            read_log_tail(&self.stderr_path),
+        )
+    }
+}
+
+impl Drop for CapturedProcess {
+    fn drop(&mut self) {
+        let Ok(mut child) = self.child.lock() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
+/// Poll a readiness predicate until it succeeds or the condition deadline is
+/// reached. The short interval is only a polling cadence; callers must make
+/// the predicate observe the real endpoint or process state.
+pub fn wait_for_condition<F>(timeout: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep((deadline - now).min(POLL_INTERVAL));
+    }
+}
+
+/// Locate a runtime binary from an explicit test override, Cargo's binary
+/// environment, or the common workspace target profiles.
+pub fn binary_path(name: &str) -> Option<PathBuf> {
+    let executable_name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("GUI test crate should live below workspace root")
+        .to_path_buf();
+    let explicit_variable = match name {
+        "neomacs" => Some("NEOMACS_GUI_TEST_BINARY"),
+        "neomacsclient" => Some("NEOMACS_GUI_TEST_CLIENT_BINARY"),
+        _ => None,
+    };
+    let cargo_binary = match name {
+        "neomacs" => option_env!("CARGO_BIN_EXE_neomacs"),
+        "neomacsclient" => option_env!("CARGO_BIN_EXE_neomacsclient"),
+        _ => None,
+    };
+    let mut candidates = Vec::new();
+    if let Some(variable) = explicit_variable
+        && let Some(path) = std::env::var_os(variable)
+        && !path.is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = cargo_binary {
+        candidates.push(PathBuf::from(path));
+    }
+    if name == "neomacsclient"
+        && let Some(path) = std::env::var_os("NEOMACS_GUI_TEST_BINARY")
+        && let Some(parent) = Path::new(&path).parent()
+    {
+        candidates.push(parent.join(&executable_name));
+    }
+    let profiles = std::env::var_os("NEOMACS_GUI_TEST_PROFILE")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([
+            PathBuf::from("dev-release"),
+            PathBuf::from("release"),
+            PathBuf::from("debug"),
+        ]);
+    for profile in profiles {
+        let profile = if profile.is_absolute() {
+            profile
+        } else {
+            workspace_root.join("target").join(profile)
+        };
+        candidates.push(profile.join(&executable_name));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Return native X11 window identities owned by a process when the existing
+/// X11 tooling is available. Other display backends have no shared identity
+/// query in this harness and return an empty list.
+pub fn native_window_ids(pid: u32, display_env: &[(String, String)]) -> io::Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("xdotool")
+            .args(["search", "--pid", &pid.to_string()])
+            .envs(display_env.iter().map(|(key, value)| (key, value)))
+            .output()?;
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, display_env);
+        Ok(Vec::new())
+    }
+}
+
 fn start_weston_headless(artifact_root: &Path) -> io::Result<DisplaySession> {
     let runtime_dir =
         std::env::temp_dir().join(format!("neomacs-gui-tests-{}", std::process::id()));
@@ -691,16 +855,16 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
     path.exists()
 }
 
-fn set_owner_only_dir_permissions(path: &Path) -> io::Result<()> {
+fn set_owner_only_dir_permissions(_path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
-fn read_log_tail(path: &Path) -> String {
+pub fn read_log_tail(path: &Path) -> String {
     match fs::read_to_string(path) {
         Ok(contents) => contents
             .lines()

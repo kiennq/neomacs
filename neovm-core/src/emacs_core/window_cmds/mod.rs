@@ -6321,6 +6321,28 @@ pub(crate) fn delete_frame_owned(
     if !eval.frames.delete_frame(fid) {
         return Err(signal("error", vec![Value::string("Cannot delete frame")]));
     }
+    if was_top_level_gui_frame
+        && !eval.frames.frame_list().into_iter().any(|frame_id| {
+            eval.frames
+                .get(frame_id)
+                .is_some_and(|frame| frame.effective_window_system().is_some())
+        })
+        && let Some(terminal_frame_id) = eval.frames.frame_list().into_iter().find(|frame_id| {
+            eval.frames.get(*frame_id).is_some_and(|frame| {
+                frame.terminal_id == terminal_id && frame_is_top_level_non_window(frame)
+            })
+        })
+    {
+        eval.frames.select_frame(terminal_frame_id);
+        if let Some(selected_wid) = eval
+            .frames
+            .get(terminal_frame_id)
+            .map(|f| f.selected_window)
+        {
+            let _ = eval.frames.note_window_selected(selected_wid);
+        }
+        sync_selected_window_buffer_in_state(&eval.frames, &mut eval.buffers, terminal_frame_id);
+    }
     if let Some(host) = eval.display_host.as_mut() {
         if was_gui_child_frame {
             tracing::info!(
