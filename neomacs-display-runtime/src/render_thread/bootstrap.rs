@@ -65,11 +65,13 @@ impl RenderApp {
             };
 
         let adapter_info = adapter.get_info();
+        let cpu_adapter = super::state::is_cpu_adapter(adapter_info.device_type);
         tracing::info!(
-            "wgpu adapter: {} (vendor={:04x}, device={:04x}, backend={:?})",
+            "wgpu adapter: {} (vendor={:04x}, device={:04x}, type={:?}, backend={:?})",
             adapter_info.name,
             adapter_info.vendor,
             adapter_info.device,
+            adapter_info.device_type,
             adapter_info.backend
         );
 
@@ -197,6 +199,7 @@ impl RenderApp {
             device: device.clone(),
             queue: queue.clone(),
         });
+        self.cpu_adapter = cpu_adapter;
         let mut renderer = renderer;
         if let Some(max_bytes) = super::state::media_budget_env_limit() {
             renderer.set_media_budget_limit(max_bytes);
@@ -217,21 +220,12 @@ impl RenderApp {
                 },
             });
 
-        {
-            let primary = self.frame_windows.primary_window_mut().unwrap();
-            primary
-                .render
-                .populate_glyph_atlas(&device, pending_scale_factor);
-            primary
-                .render
-                .cursor
-                .apply_config(self.cursor_defaults.config_snapshot());
-            primary
-                .render
-                .compositor
-                .transitions
-                .apply_policy(self.transition_policy);
-        }
+        self.frame_windows
+            .primary_window_mut()
+            .unwrap()
+            .render
+            .populate_glyph_atlas(&device, pending_scale_factor);
+        self.apply_requested_visual_config();
 
         let pending_frame_chrome = self
             .frame_windows
@@ -347,16 +341,8 @@ impl RenderApp {
         }
         if let Some(primary) = self.frame_windows.primary_window_mut() {
             primary.render.populate_glyph_atlas(&device, scale_factor);
-            primary
-                .render
-                .cursor
-                .apply_config(self.cursor_defaults.config_snapshot());
-            primary
-                .render
-                .compositor
-                .transitions
-                .apply_policy(self.transition_policy);
         }
+        self.apply_requested_visual_config();
         self.frame_windows.mark_top_level_dirty();
         #[cfg(test)]
         self.record_primary_gpu_initialization(PrimaryGpuInitialization::Reuse);

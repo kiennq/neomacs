@@ -477,6 +477,7 @@ impl RenderApp {
         extra_line_spacing: f32,
         extra_letter_spacing: f32,
         cursor_only_hint: bool,
+        cpu_adapter: bool,
         device_lost: &mut super::device_loss::DeviceLossDetector,
     ) -> Result<RenderedFrameSurface, FrameRenderFailure> {
         Self::render_frame_window_contents_to_acquired_surface(
@@ -490,6 +491,7 @@ impl RenderApp {
             extra_letter_spacing,
             None,
             cursor_only_hint,
+            cpu_adapter,
             device_lost,
         )
     }
@@ -506,6 +508,7 @@ impl RenderApp {
         extra_letter_spacing: f32,
         output: Option<wgpu::SurfaceTexture>,
         cursor_only_hint: bool,
+        cpu_adapter: bool,
         device_lost: &mut super::device_loss::DeviceLossDetector,
     ) -> Result<RenderedFrameSurface, FrameRenderFailure> {
         let render = &mut window_state.render;
@@ -533,8 +536,11 @@ impl RenderApp {
         // cursor. The frame's stored cursor geometry is no longer mutated here,
         // so the materialized frame stays a pure function of the layout snapshot.
 
-        let need_offscreen =
-            render.compositor.transitions.policy.needs_offscreen() || frame_has_theme_transition;
+        let need_offscreen = super::state::needs_offscreen_render(
+            render.compositor.transitions.policy,
+            frame_has_theme_transition,
+            cpu_adapter,
+        );
 
         let output = if let Some(output) = output {
             output
@@ -592,6 +598,11 @@ impl RenderApp {
         let mut frame = render
             .take_current_frame_for_render()
             .ok_or(FrameRenderFailure::AwaitingContent)?;
+        if cpu_adapter {
+            frame.transition_hints.clear();
+            frame.effect_hints.clear();
+            frame.cursor_effects_by_window.clear();
+        }
         render.begin_presentable_render();
         if extra_line_spacing != 0.0 || extra_letter_spacing != 0.0 {
             Self::apply_extra_spacing(
@@ -1464,6 +1475,7 @@ impl RenderApp {
             self.extra_line_spacing,
             self.extra_letter_spacing,
             cursor_only_hint,
+            self.cpu_adapter,
             &mut self.device_lost,
         );
         let (output, frame) = match rendered {

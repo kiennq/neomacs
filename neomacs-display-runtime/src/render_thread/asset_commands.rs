@@ -524,22 +524,28 @@ impl RenderApp {
                     renderer.free_surface(id);
                 }
             }
-            AssetCommand::FrameShaderSet { composed } => {
-                if let Some(ref mut renderer) = self.renderer {
-                    match composed {
-                        Some((source, language, uniforms)) => {
-                            if let Err(err) = renderer.set_frame_post(language, &source, &uniforms)
-                            {
-                                tracing::warn!("frame shader install failed: {err}");
-                            }
+            AssetCommand::FrameShaderSet { composed } => match composed {
+                Some((_source, _language, _uniforms)) if self.cpu_adapter => {
+                    tracing::warn!("Ignoring frame shader installation on CPU adapter");
+                }
+                Some((source, language, uniforms)) => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        if let Err(err) = renderer.set_frame_post(language, &source, &uniforms) {
+                            tracing::warn!("frame shader install failed: {err}");
                         }
-                        None => renderer.clear_frame_post(),
                     }
                 }
-            }
+                None => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.clear_frame_post();
+                    }
+                }
+            },
             AssetCommand::FrameShaderSetUniform { name, value } => {
-                if let Some(ref mut renderer) = self.renderer {
-                    renderer.set_frame_post_uniform(&name, value);
+                if !self.cpu_adapter {
+                    if let Some(ref mut renderer) = self.renderer {
+                        renderer.set_frame_post_uniform(&name, value);
+                    }
                 }
             }
         }
