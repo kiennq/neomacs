@@ -81,6 +81,9 @@ crossbeam-channel.workspace = true
 libc.workspace = true
 crossterm = "0.29"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 hostname.workspace = true
 tempfile.workspace = true

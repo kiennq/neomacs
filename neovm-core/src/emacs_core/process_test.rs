@@ -7812,20 +7812,71 @@ fn make_network_process_feature_advertisement_is_conservative() {
         any(target_os = "linux", target_os = "android") => {
             "OK (t t t t t t t t t t t t t t t t t t)"
         }
-        _ => {
+        unix => {
             "OK (t t t t t t t t t t t nil t nil t t t t)"
+        }
+        _ => {
+            if crate::local_socket::stream_supported() {
+                "OK (t t t t t t t t t t t nil t nil t t t t)"
+            } else {
+                "OK (t nil t t t t t t t t t nil t nil t t t t)"
+            }
         }
     };
     let expected_subfeatures = cfg_select! {
         any(target_os = "linux", target_os = "android") => {
-            "OK (:nodelay :reuseaddr :priority :oobinline :linger :keepalive :dontroute :broadcast :bindtodevice (:family local) (:family ipv4) (:family ipv6) (:service t) (:server t) (:nowait t) (:type datagram) (:type seqpacket))"
+            "OK (:nodelay :reuseaddr :priority :oobinline :linger :keepalive :dontroute :broadcast :bindtodevice (:family ipv4) (:family ipv6) (:service t) (:server t) (:nowait t) (:type datagram) (:type seqpacket) (:family local))"
+        }
+        unix => {
+            "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:family ipv4) (:family ipv6) (:service t) (:server t) (:nowait t) (:type datagram) (:type seqpacket) (:family local))"
         }
         _ => {
-            "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:family local) (:family ipv4) (:family ipv6) (:service t) (:server t) (:nowait t) (:type datagram) (:type seqpacket))"
+            if crate::local_socket::stream_supported() {
+                "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:family ipv4) (:family ipv6) (:service t) (:server t) (:nowait t) (:type datagram) (:type seqpacket) (:family local))"
+            } else {
+                "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:family ipv4) (:family ipv6) (:service t) (:server t) (:nowait t) (:type datagram) (:type seqpacket))"
+            }
         }
     };
     assert_eq!(results[0], expected_featurep);
     assert_eq!(results[1], expected_subfeatures);
+}
+
+fn features_contain_local_family(features: Value) -> bool {
+    crate::emacs_core::value::list_to_vec(&features)
+        .expect("make-network-process subfeatures should be a proper list")
+        .into_iter()
+        .any(|feature| {
+            crate::emacs_core::value::list_to_vec(&feature)
+                .is_some_and(|parts| parts == [Value::symbol(":family"), Value::symbol("local")])
+        })
+}
+
+#[test]
+fn make_network_process_local_family_matches_platform() {
+    let features = make_network_process_subfeatures();
+    assert_eq!(
+        features_contain_local_family(features),
+        cfg!(unix) || crate::local_socket::stream_supported(),
+        "local sockets must not be advertised where make-network-process rejects them"
+    );
+}
+
+#[test]
+fn make_network_process_constructor_applies_reuseaddr_on_all_platforms() {
+    crate::test_utils::init_test_tracing();
+    let results = eval_all(
+        r#"(let ((p (make-network-process
+                    :name "netopt-reuseaddr" :server t :service 0
+                    :reuseaddr t)))
+             (unwind-protect
+                 (list
+                  (process-status p)
+                  (process-contact p :reuseaddr))
+               (ignore-errors (delete-process p))))"#,
+    );
+
+    assert_eq!(results[0], "OK (listen t)");
 }
 
 #[test]
@@ -8171,9 +8222,12 @@ fn process_send_string_waits_for_nowait_tcp_connect_like_gnu() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn process_send_string_waits_for_nowait_local_stream_connect_like_gnu() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((events nil) (recv nil) (srv nil) (cli nil)
@@ -8744,6 +8798,49 @@ fn make_network_process_stream_server_accepts_client_like_gnu() {
 }
 
 #[test]
+fn make_network_process_server_plist_isolated_between_accepted_clients() {
+    crate::test_utils::init_test_tracing();
+    let results = eval_all(
+        r#"(let ((events nil)
+                 (srv nil)
+                 (cli1 nil)
+                 (cli2 nil))
+             (unwind-protect
+                 (progn
+                   (setq srv (make-network-process
+                              :name "plist-srv" :server t :service t :host 'local
+                              :plist '(:authenticated nil :foo bar)
+                              :log (lambda (server client _msg)
+                                     (when (null events)
+                                       (process-put client :authenticated t))
+                                     (push (list (process-get server :authenticated)
+                                                 (process-get client :authenticated)
+                                                 (process-get client :foo))
+                                           events))))
+                   (setq cli1 (make-network-process
+                               :name "plist-cli1" :host 'local
+                               :service (process-contact srv :service)))
+                   (dotimes (_ 20)
+                     (when (< (length events) 1)
+                       (accept-process-output nil 0.05)))
+                   (setq cli2 (make-network-process
+                               :name "plist-cli2" :host 'local
+                               :service (process-contact srv :service)))
+                   (dotimes (_ 20)
+                     (when (< (length events) 2)
+                       (accept-process-output nil 0.05)))
+                   (list (process-get srv :authenticated)
+                         (process-get srv :foo)
+                         (nreverse events)))
+               (when cli2 (delete-process cli2))
+               (when cli1 (delete-process cli1))
+               (when srv (delete-process srv))))"#,
+    );
+
+    assert_eq!(results[0], "OK (nil bar ((nil t bar) (nil nil bar)))");
+}
+
+#[test]
 fn make_network_process_explicit_inet_address_skips_host_service_family_like_gnu() {
     crate::test_utils::init_test_tracing();
     let results = eval_all(
@@ -8783,9 +8880,87 @@ fn make_network_process_explicit_inet_address_skips_host_service_family_like_gnu
     assert_eq!(results[0], "OK (listen t t t 42 bogus open t t 42 nil)");
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+#[test]
+fn local_server_stream_bind_prepares_selected_socket_directory() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
+
+    use tempfile::tempdir;
+
+    let _guard = crate::local_socket::TEST_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let root = tempdir().unwrap();
+    let selected = root.path().join("selected");
+    let endpoint = selected.join("server");
+    let old_override = std::env::var_os("NEOMACS_SERVER_SOCKET_DIR");
+    unsafe {
+        std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", &selected);
+    }
+
+    let listener = bind_unix_listener_socket(&endpoint, 1, &[]).expect("bind local server");
+    assert!(selected.is_dir());
+    drop(listener);
+
+    match old_override {
+        Some(value) => unsafe { std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", value) },
+        None => unsafe { std::env::remove_var("NEOMACS_SERVER_SOCKET_DIR") },
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn local_server_stream_bind_reports_socket_path_and_policy_detail() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
+
+    use tempfile::tempdir;
+
+    let _guard = crate::local_socket::TEST_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let root = tempdir().unwrap();
+    let selected = root.path().join("existing");
+    let endpoint = selected.join("server");
+    std::fs::create_dir_all(&selected).unwrap();
+    let old_override = std::env::var_os("NEOMACS_SERVER_SOCKET_DIR");
+    unsafe {
+        std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", &selected);
+    }
+
+    let endpoint_lisp = endpoint
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let detail = eval_one(&format!(
+        r#"(condition-case err
+               (make-network-process
+                :name "socket-policy-error"
+                :server t
+                :family 'local
+                :service "{endpoint_lisp}")
+             (error err))"#
+    ));
+    assert!(detail.contains(&endpoint_lisp), "{detail}");
+    assert!(detail.contains("DACL"), "{detail}");
+
+    match old_override {
+        Some(value) => unsafe { std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", value) },
+        None => unsafe { std::env::remove_var("NEOMACS_SERVER_SOCKET_DIR") },
+    }
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn make_network_process_local_stream_server_accepts_client_like_gnu() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((path (make-temp-file "neomacs-local-sock-"))
@@ -8827,9 +9002,12 @@ fn make_network_process_local_stream_server_accepts_client_like_gnu() {
     assert_eq!(results[0], "OK (listen t t open t t 1 t t t t)");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn make_network_process_server_plist_is_inherited_by_accepted_local_client() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((path (make-temp-file "neomacs-local-plist-"))
@@ -8862,9 +9040,12 @@ fn make_network_process_server_plist_is_inherited_by_accepted_local_client() {
     assert_eq!(results[0], "OK (t bar 1 (t t bar))");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn make_network_process_explicit_local_address_skips_family_like_gnu() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((path (make-temp-file "neomacs-local-address-"))

@@ -38,6 +38,9 @@ pub mod compat_regressions;
 pub mod composite;
 pub mod cus_start_platform_vars;
 pub mod custom;
+pub mod daemon;
+#[cfg(test)]
+mod daemon_test;
 pub mod data;
 pub mod debug;
 pub mod debug_on_call;

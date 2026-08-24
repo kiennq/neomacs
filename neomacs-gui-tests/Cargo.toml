@@ -14,3 +14,7 @@ publish = false
 getrandom.workspace = true
 image.workspace = true
 serde_json = "1"
+
+[dev-dependencies]
+neovm-core.workspace = true
+tempfile.workspace = true
