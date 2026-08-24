@@ -7,7 +7,7 @@
 //!
 //! ## Network processes
 //!
-//! `make-network-process` supports TCP streams, UDP datagrams, and Unix local
+//! `make-network-process` supports TCP streams, UDP datagrams, and AF_UNIX local
 //! sockets on platforms that provide them. Network sockets are registered with
 //! the process I/O poller so `accept-process-output` and `poll_process_output`
 //! wake on incoming data.  Unix child pipes are also poller-backed; Windows
@@ -22,6 +22,7 @@
 use crate::emacs_core::callproc::{ChildStdio, SpawnedChild};
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_min_args};
+use crate::local_socket;
 use num_enum::IntoPrimitive;
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use std::collections::HashMap;
@@ -35,7 +36,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
-use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -62,10 +63,8 @@ pub enum NetworkSocket {
     SeqpacketStream(Socket),
     #[cfg(unix)]
     SeqpacketListener(Socket),
-    #[cfg(unix)]
-    UnixStream(UnixStream),
-    #[cfg(unix)]
-    UnixListener(UnixListener),
+    UnixStream(Socket),
+    UnixListener(Socket),
     #[cfg(unix)]
     UnixDatagram(UnixDatagram),
 }
@@ -281,9 +280,7 @@ impl NetworkSocket {
             Self::SeqpacketStream(_) => "seqpacket-stream",
             #[cfg(unix)]
             Self::SeqpacketListener(_) => "seqpacket-listener",
-            #[cfg(unix)]
             Self::UnixStream(_) => "unix-stream",
-            #[cfg(unix)]
             Self::UnixListener(_) => "unix-listener",
             #[cfg(unix)]
             Self::UnixDatagram(_) => "unix-datagram",
@@ -305,11 +302,9 @@ impl NetworkSocket {
             Self::SeqpacketListener(socket) => {
                 ProcessManager::register_readable_source(poller, socket, id)
             }
-            #[cfg(unix)]
             Self::UnixStream(stream) => {
                 ProcessManager::register_readable_source(poller, stream, id)
             }
-            #[cfg(unix)]
             Self::UnixListener(listener) => {
                 ProcessManager::register_readable_source(poller, listener, id)
             }
@@ -333,11 +328,9 @@ impl NetworkSocket {
             Self::SeqpacketListener(_) => {
                 Err("Listener sockets are not writable process sources".into())
             }
-            #[cfg(unix)]
             Self::UnixStream(stream) => {
                 ProcessManager::register_writable_source(poller, stream, id)
             }
-            #[cfg(unix)]
             Self::UnixListener(_) => {
                 Err("Listener sockets are not writable process sources".into())
             }
@@ -367,11 +360,9 @@ impl NetworkSocket {
             Self::SeqpacketListener(socket) => {
                 let _ = poller.delete(socket);
             }
-            #[cfg(unix)]
             Self::UnixStream(stream) => {
                 let _ = poller.delete(stream);
             }
-            #[cfg(unix)]
             Self::UnixListener(listener) => {
                 let _ = poller.delete(listener);
             }
@@ -391,9 +382,7 @@ impl NetworkSocket {
             Self::SeqpacketStream(socket) => Some(socket.read(buf)),
             #[cfg(unix)]
             Self::SeqpacketListener(_) => None,
-            #[cfg(unix)]
             Self::UnixStream(stream) => Some(stream.read(buf)),
-            #[cfg(unix)]
             Self::UnixListener(_) => None,
             #[cfg(unix)]
             Self::UnixDatagram(_) => None,
@@ -420,9 +409,7 @@ impl NetworkSocket {
             Self::SeqpacketStream(socket) => Some(socket.write(bytes)),
             #[cfg(unix)]
             Self::SeqpacketListener(_) => None,
-            #[cfg(unix)]
             Self::UnixStream(stream) => Some(stream.write(bytes)),
-            #[cfg(unix)]
             Self::UnixListener(_) => None,
             #[cfg(unix)]
             Self::UnixDatagram(socket) => Some(match datagram_unix_path {
@@ -459,9 +446,7 @@ impl NetworkSocket {
                 socket,
                 polling::Event::readable(id as usize),
             ),
-            #[cfg(unix)]
             Self::UnixStream(stream) => ProcessManager::modify_poll_source(poller, stream, event),
-            #[cfg(unix)]
             Self::UnixListener(listener) => ProcessManager::modify_poll_source(
                 poller,
                 listener,
@@ -481,9 +466,7 @@ impl NetworkSocket {
             Self::SeqpacketStream(socket) => Some(socket.shutdown(Shutdown::Write)),
             #[cfg(unix)]
             Self::SeqpacketListener(_) => None,
-            #[cfg(unix)]
             Self::UnixStream(stream) => Some(stream.shutdown(Shutdown::Write)),
-            #[cfg(unix)]
             Self::UnixListener(_) => None,
             #[cfg(unix)]
             Self::UnixDatagram(_) => None,
@@ -493,7 +476,6 @@ impl NetworkSocket {
     fn take_pending_connect_error(&self) -> Option<std::io::Result<Option<std::io::Error>>> {
         match self {
             Self::TcpStream(stream) => Some(stream.take_error()),
-            #[cfg(unix)]
             Self::UnixStream(stream) => Some(stream.take_error()),
             _ => None,
         }

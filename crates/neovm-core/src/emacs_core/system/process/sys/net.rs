@@ -139,10 +139,10 @@ pub fn sockaddr_in6_payload_len() -> usize {
     }
 }
 
-/// Length of a `sockaddr_un` past its family field (Unix local sockets).
+/// Length of the `sun_path` array in a `sockaddr_un` (Unix local sockets).
 #[cfg(unix)]
 pub fn sockaddr_un_payload_len() -> usize {
-    std::mem::size_of::<libc::sockaddr_un>() - std::mem::size_of::<libc::sa_family_t>()
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path)
 }
 
 /// Resolve a service name (e.g. "http") for a protocol ("tcp"/"udp") to its
@@ -183,8 +183,42 @@ pub fn connect_is_pending(err: &std::io::Error) -> bool {
                     || code == libc::EALREADY
         )
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAEALREADY, WSAEINPROGRESS, WSAEWOULDBLOCK,
+        };
+        matches!(
+            err.raw_os_error(),
+            Some(code)
+                if code == WSAEWOULDBLOCK
+                    || code == WSAEINPROGRESS
+                    || code == WSAEALREADY
+        )
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_is_pending;
+
+    #[test]
+    fn would_block_connect_is_pending() {
+        assert!(connect_is_pending(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "pending",
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn winsock_nonblocking_connect_errors_are_pending() {
+        for code in [10035, 10036, 10037] {
+            assert!(connect_is_pending(&std::io::Error::from_raw_os_error(code)));
+        }
     }
 }

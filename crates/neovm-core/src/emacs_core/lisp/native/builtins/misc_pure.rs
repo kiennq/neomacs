@@ -181,15 +181,16 @@ fn message_dolog(
     // complete message.  Echo-area printer output deliberately leaves a
     // fragment open, so the next ordinary message first terminates it.
     if termination != MessageLogTermination::Fragment {
-        let needs_newline = ctx.buffers.get(buf_id).is_some_and(|buffer| {
-            let full = buffer.full_emacs_byte_range();
-            full.start() < full.end()
-                && buffer.buffer_substring_bytes_range(crate::buffer::EmacsByteRange::new(
-                    full.end()
-                        .saturating_sub_len(crate::buffer::EmacsByteLen::new(1)),
-                    full.end(),
-                )) != b"\n"
-        });
+        let needs_newline = zv_at_end
+            && ctx.buffers.get(buf_id).is_some_and(|buffer| {
+                let full = buffer.full_emacs_byte_range();
+                full.start() < full.end()
+                    && buffer.buffer_substring_bytes_range(crate::buffer::EmacsByteRange::new(
+                        full.end()
+                            .saturating_sub_len(crate::buffer::EmacsByteLen::new(1)),
+                        full.end(),
+                    )) != b"\n"
+            });
         if needs_newline {
             let _ = ctx.buffers.goto_buffer_emacs_byte_pos(buf_id, old_full_end);
             let _ = ctx.buffers.insert_into_buffer(buf_id, "\n");
@@ -518,17 +519,56 @@ pub(crate) fn builtin_current_message(
 
 pub(crate) fn builtin_daemonp(args: Vec<Value>) -> EvalResult {
     expect_args("daemonp", &args, 0)?;
-    Ok(Value::NIL)
+    Ok(super::super::daemon::daemon_value())
 }
 
-pub(crate) fn builtin_daemon_initialized(args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_daemon_initialized(
+    ctx: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
     expect_args("daemon-initialized", &args, 0)?;
-    Err(signal(
-        "error",
-        vec![Value::string(
-            "This function can only be called if emacs is run as a daemon",
-        )],
-    ))
+    if !super::super::daemon::is_daemon() {
+        return Err(signal(
+            "error",
+            vec![Value::string(
+                "This function can only be called if emacs is run as a daemon",
+            )],
+        ));
+    }
+    if super::super::daemon::is_initialized() {
+        return Err(signal(
+            "error",
+            vec![Value::string("The daemon has already been initialized")],
+        ));
+    }
+    if ctx
+        .visible_variable_value_or_nil("after-init-time")
+        .is_nil()
+    {
+        return Err(signal(
+            "error",
+            vec![Value::string(
+                "This function can only be called after loading the init files",
+            )],
+        ));
+    }
+    match super::super::daemon::mark_initialized() {
+        Ok(()) => Ok(Value::NIL),
+        Err(super::super::daemon::DaemonStateError::AlreadyInitialized) => Err(signal(
+            "error",
+            vec![Value::string("The daemon has already been initialized")],
+        )),
+        Err(super::super::daemon::DaemonStateError::NotDaemon) => Err(signal(
+            "error",
+            vec![Value::string(
+                "This function can only be called if emacs is run as a daemon",
+            )],
+        )),
+        Err(super::super::daemon::DaemonStateError::ReadinessSignalFailed) => Err(signal(
+            "error",
+            vec![Value::string("Failed to signal daemon readiness")],
+        )),
+    }
 }
 
 pub(crate) fn builtin_documentation_stringp(args: Vec<Value>) -> EvalResult {
