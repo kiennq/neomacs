@@ -1,6 +1,10 @@
 use super::{RenderApp, RenderUserEvent, SharedImageMetadata, SharedMonitorInfo, surface_readback};
 use crate::render_thread::frame_windows::{FrameLifecycle, GuiFrameNativeWindowState};
-use crate::render_thread::state::RenderGpuContext;
+use crate::render_thread::state::{
+    DeviceRecoveryTarget, PrimaryGpuInitialization, RenderGpuContext, RenderStartupMode,
+    device_recovery_target, primary_gpu_initialization_plan,
+};
+use crate::render_thread::x11_hints::apply_window_geometry_hints;
 use crate::thread_comm::{InputEvent, RenderComms};
 use neomacs_renderer_wgpu::WgpuRenderer;
 use std::sync::Arc;
@@ -19,7 +23,15 @@ use crate::backend::wpe::WpeBackend;
 use crate::backend::wpe::sys::platform as plat;
 
 impl RenderApp {
-    pub(super) fn init_wgpu(&mut self, event_loop: &ActiveEventLoop, window: Arc<Window>) {
+    #[cfg(test)]
+    pub(super) fn record_primary_gpu_initialization(&mut self, kind: PrimaryGpuInitialization) {
+        if kind != PrimaryGpuInitialization::Reuse {
+            self.full_gpu_initializations += 1;
+        }
+        self.primary_surface_creations += 1;
+    }
+
+    pub(super) fn init_wgpu(&mut self, event_loop: &ActiveEventLoop, window: Arc<Window>) -> bool {
         tracing::info!("Initializing wgpu for render thread");
 
         let instance_descriptor =
@@ -34,7 +46,7 @@ impl RenderApp {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to create wgpu surface: {:?}", e);
-                return;
+                return false;
             }
         };
 
@@ -48,7 +60,7 @@ impl RenderApp {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::error!("Failed to find suitable GPU adapter: {:?}", e);
-                    return;
+                    return false;
                 }
             };
 
@@ -73,7 +85,7 @@ impl RenderApp {
                 Ok((d, q)) => (d, q),
                 Err(e) => {
                     tracing::error!("Failed to create wgpu device: {:?}", e);
-                    return;
+                    return false;
                 }
             };
 
@@ -257,6 +269,198 @@ impl RenderApp {
 
         #[cfg(feature = "video")]
         tracing::info!("Video cache initialized");
+
+        #[cfg(test)]
+        self.record_primary_gpu_initialization(PrimaryGpuInitialization::Initialize);
+        true
+    }
+
+    fn create_primary_surface_with_existing_gpu(&mut self, window: Arc<Window>) -> bool {
+        let Some((instance, adapter, device)) = self
+            .gpu
+            .as_ref()
+            .map(|gpu| (&gpu.instance, &gpu.adapter, gpu.device.clone()))
+        else {
+            return false;
+        };
+        let surface = match instance.create_surface(window.clone()) {
+            Ok(surface) => surface,
+            Err(error) => {
+                tracing::error!("Failed to create primary surface: {:?}", error);
+                return false;
+            }
+        };
+        let caps = surface.get_capabilities(adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|format| format.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let alpha_mode = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            caps.alpha_modes[0]
+        };
+        let surface_usage = surface_readback::surface_usage_for_debug_readback(
+            caps.usages,
+            &mut self.debug_first_frame_readback_pending,
+            self.debug_surface_readback_frames_remaining > 0,
+        );
+        let phys = window.inner_size();
+        let scale_factor = super::state::effective_window_scale_factor(window.scale_factor());
+        let config = wgpu::SurfaceConfiguration {
+            usage: surface_usage,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: phys.width,
+            height: phys.height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let chrome = self
+            .frame_windows
+            .primary_window()
+            .map(|primary| primary.lifecycle.chrome().clone());
+        let Some(chrome) = chrome else {
+            return false;
+        };
+        self.frame_windows
+            .populate_primary_native(GuiFrameNativeWindowState {
+                window,
+                surface,
+                surface_config: config,
+                width: phys.width,
+                height: phys.height,
+                scale_factor,
+                chrome,
+            });
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.resize(phys.width, phys.height);
+        }
+        if let Some(primary) = self.frame_windows.primary_window_mut() {
+            primary.render.populate_glyph_atlas(&device, scale_factor);
+            primary
+                .render
+                .cursor
+                .apply_config(self.cursor_defaults.config_snapshot());
+            primary
+                .render
+                .compositor
+                .transitions
+                .apply_policy(self.transition_policy);
+        }
+        self.frame_windows.mark_top_level_dirty();
+        #[cfg(test)]
+        self.record_primary_gpu_initialization(PrimaryGpuInitialization::Reuse);
+        true
+    }
+
+    pub(super) fn create_pending_primary(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(primary) = self.frame_windows.primary_window() else {
+            return;
+        };
+        if primary.lifecycle.is_active() {
+            return;
+        }
+        let (width, height) = primary.native_size();
+        let chrome = primary.lifecycle.chrome().clone();
+        let geometry_hints = primary.lifecycle.geometry_hints();
+        let attrs = Window::default_attributes()
+            .with_title(&chrome.title)
+            .with_inner_size(super::state::window_size_from_emacs_pixels(width, height))
+            .with_decorations(chrome.decorations_enabled)
+            .with_transparent(true);
+        let attrs = crate::window_identity::apply_platform_window_identity(attrs);
+
+        tracing::info!(
+            "Render thread creating primary window: emacs_pixels={}x{} title={:?}",
+            width,
+            height,
+            chrome.title
+        );
+        let Ok(window) = event_loop.create_window(attrs) else {
+            tracing::error!("Failed to create primary window");
+            return;
+        };
+        let window = Arc::new(window);
+        super::frame_windows::NativeTextInputPolicy::for_gui_frame().apply_to_window(&window);
+        self.window_icon.apply(&window);
+
+        if self.clipboard.is_err() {
+            self.clipboard =
+                crate::clipboard::ClipboardService::for_display(event_loop.owned_display_handle());
+            if let Err(error) = &self.clipboard {
+                tracing::error!("Failed to initialize clipboard service: {error}");
+            }
+        }
+
+        let effective_scale = super::state::effective_window_scale_factor(window.scale_factor());
+        let phys = window.inner_size();
+        if let Some(primary) = self.frame_windows.primary_window_mut() {
+            if let FrameLifecycle::Pending {
+                width,
+                height,
+                scale_factor,
+                ..
+            } = &mut primary.lifecycle
+            {
+                *width = phys.width;
+                *height = phys.height;
+                *scale_factor = effective_scale;
+            }
+        }
+
+        let deferred_recovery = self.lifecycle_flags.device_recovery_deferred;
+        let initialization = primary_gpu_initialization_plan(
+            self.gpu.is_some(),
+            self.renderer.is_some(),
+            deferred_recovery,
+        );
+        match initialization {
+            PrimaryGpuInitialization::Initialize | PrimaryGpuInitialization::RebuildAfterLoss => {
+                if initialization == PrimaryGpuInitialization::RebuildAfterLoss {
+                    self.toolbar.icon_textures.clear();
+                    self.renderer = None;
+                    self.frame_windows.clear_gpu_resident_state();
+                    self.gpu = None;
+                }
+                if !self.init_wgpu(event_loop, window.clone()) {
+                    return;
+                }
+            }
+            PrimaryGpuInitialization::Reuse => {
+                if !self.create_primary_surface_with_existing_gpu(window.clone()) {
+                    return;
+                }
+            }
+        }
+        self.lifecycle_flags.device_recovery_deferred = false;
+
+        if deferred_recovery {
+            if let Some(gpu) = self.gpu.as_ref() {
+                self.frame_windows.recreate_secondary_native_surfaces(
+                    &gpu.instance,
+                    &gpu.device,
+                    &gpu.adapter,
+                );
+            }
+            self.frame_windows.mark_top_level_dirty();
+            self.frame_windows
+                .for_each_top_level_window(|window_state| window_state.request_redraw());
+            self.comms.send_input(InputEvent::DisplayReset);
+        }
+
+        if let Some(geometry_hints) = geometry_hints {
+            apply_window_geometry_hints(&window, geometry_hints);
+        }
     }
 
     /// Rebuild the entire GPU stack after the wgpu device was lost (a user
@@ -273,6 +477,35 @@ impl RenderApp {
         tracing::error!(
             "wgpu device lost — rebuilding GPU state and asking the evaluator to re-resolve media"
         );
+
+        let primary_active = self
+            .frame_windows
+            .primary_window()
+            .is_some_and(|window| window.window().is_some());
+        match device_recovery_target(
+            primary_active,
+            self.frame_windows.has_active_secondary_native_window(),
+        ) {
+            DeviceRecoveryTarget::Primary => {}
+            DeviceRecoveryTarget::SurvivingSecondary => {
+                if self
+                    .frame_windows
+                    .promote_active_secondary_to_primary()
+                    .is_none()
+                {
+                    self.lifecycle_flags.device_recovery_deferred = true;
+                    tracing::warn!(
+                        "device-loss recovery deferred: surviving secondary could not become primary"
+                    );
+                    return;
+                }
+            }
+            DeviceRecoveryTarget::Deferred => {
+                self.lifecycle_flags.device_recovery_deferred = true;
+                tracing::warn!("device-loss recovery deferred until a primary window is realized");
+                return;
+            }
+        }
 
         // Renderer first: pipelines and every media cache (image, video,
         // webkit, shader surfaces, frame post shader) hold old-device
@@ -320,6 +553,7 @@ impl RenderApp {
             self.device_lost.mark_lost_now();
             return;
         }
+        self.lifecycle_flags.device_recovery_deferred = false;
 
         // Secondary top-level windows: their surfaces belong to the dropped
         // instance and can never be configured against the new device;
@@ -445,6 +679,7 @@ pub(crate) fn run_render_loop_with_event_loop(
     image_metadata: SharedImageMetadata,
     shared_monitors: SharedMonitorInfo,
     poll_when_idle: bool,
+    startup_mode: RenderStartupMode,
     #[cfg(feature = "neo-term")] shared_terminals: crate::terminal::SharedTerminals,
 ) -> Result<(), String> {
     tracing::info!("Render thread starting");
@@ -473,7 +708,7 @@ pub(crate) fn run_render_loop_with_event_loop(
         std::time::Instant::now() + std::time::Duration::from_millis(16),
     ));
 
-    let mut app = RenderApp::new(
+    let mut app = RenderApp::new_with_startup_mode(
         comms,
         width,
         height,
@@ -481,6 +716,7 @@ pub(crate) fn run_render_loop_with_event_loop(
         image_metadata,
         shared_monitors,
         poll_when_idle,
+        startup_mode,
         #[cfg(feature = "neo-term")]
         shared_terminals,
     );
@@ -512,6 +748,7 @@ pub fn run_render_loop_current_thread(
     title: String,
     image_metadata: SharedImageMetadata,
     shared_monitors: SharedMonitorInfo,
+    startup_mode: RenderStartupMode,
 ) -> Result<(), String> {
     #[cfg(feature = "neo-term")]
     let shared_terminals = crate::terminal::new_shared_terminals();
@@ -525,6 +762,7 @@ pub fn run_render_loop_current_thread(
         image_metadata,
         shared_monitors,
         shared_terminals,
+        startup_mode,
     );
     #[cfg(not(feature = "neo-term"))]
     run_render_loop_with_event_loop(
@@ -536,6 +774,7 @@ pub fn run_render_loop_current_thread(
         image_metadata,
         shared_monitors,
         false,
+        startup_mode,
         #[cfg(feature = "neo-term")]
         shared_terminals,
     )
@@ -554,6 +793,7 @@ pub fn run_render_loop_current_thread_with_terminals(
     image_metadata: SharedImageMetadata,
     shared_monitors: SharedMonitorInfo,
     shared_terminals: crate::terminal::SharedTerminals,
+    startup_mode: RenderStartupMode,
 ) -> Result<(), String> {
     run_render_loop_with_event_loop(
         event_loop,
@@ -564,6 +804,7 @@ pub fn run_render_loop_current_thread_with_terminals(
         image_metadata,
         shared_monitors,
         false,
+        startup_mode,
         shared_terminals,
     )
 }
@@ -576,6 +817,7 @@ pub fn run_render_loop(
     title: String,
     image_metadata: SharedImageMetadata,
     shared_monitors: SharedMonitorInfo,
+    startup_mode: RenderStartupMode,
 ) -> Result<(), String> {
     #[cfg(feature = "neo-term")]
     let shared_terminals = crate::terminal::new_shared_terminals();
@@ -589,6 +831,7 @@ pub fn run_render_loop(
         image_metadata,
         shared_monitors,
         false,
+        startup_mode,
         #[cfg(feature = "neo-term")]
         shared_terminals,
     )
