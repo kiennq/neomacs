@@ -23,6 +23,9 @@
 //!   SIGUSR1    rc=0, nothing armed            rc=138, killed
 //! ```
 
+#[cfg(windows)]
+use super::{self as os_signal, HandledSignal};
+#[cfg(unix)]
 use super::{
     self as os_signal, HandledSignal, InstalledDisposition, PreviousDisposition, UserSignalAction,
 };
@@ -33,6 +36,7 @@ use super::{
 /// the one GNU answers: `deliver_process_signal` (src/sysdep.c:1729-1751)
 /// exists precisely because "POSIX says any thread can receive a signal that
 /// is associated with a process".
+#[cfg(unix)]
 fn kill_self(sig: libc::c_int) {
     // SAFETY: `kill` with the caller's own pid and a valid signal number.
     let rc = unsafe { libc::kill(libc::getpid(), sig) };
@@ -55,6 +59,7 @@ fn kill_self(sig: libc::c_int) {
 /// the case `deliver_process_signal` (src/sysdep.c:1729-1751) exists for in
 /// GNU and that this port handles by making the handler correct on any thread.
 /// `raise`/`pthread_kill` would take the wait away and the question with it.
+#[cfg(unix)]
 fn kill_self_and_wait(signal: HandledSignal) {
     let before = os_signal::pending_count(signal);
     kill_self(signal.number());
@@ -68,6 +73,7 @@ fn kill_self_and_wait(signal: HandledSignal) {
 /// process is TERMINATED by the signal and nextest reports it killed rather
 /// than failed.  It survives only because [`os_signal::install`] ran.
 #[test]
+#[cfg(unix)]
 fn a_user_signal_does_not_terminate_this_process_like_gnu() {
     let report = os_signal::install();
     assert!(
@@ -102,6 +108,7 @@ fn a_user_signal_does_not_terminate_this_process_like_gnu() {
 /// `#if !defined HAVE_ANDROID`, because `android_select` uses them -- does not
 /// apply here.
 #[test]
+#[cfg(unix)]
 fn the_two_user_signals_were_unclaimed_before_this_port_installed_them() {
     let report = os_signal::install();
     for signal in HandledSignal::ALL {
@@ -121,6 +128,7 @@ fn the_two_user_signals_were_unclaimed_before_this_port_installed_them() {
 /// last discriminant, so a variant that is not listed is a compile error, and
 /// an emptied table fails here rather than passing over nothing.
 #[test]
+#[cfg(unix)]
 fn every_handled_signal_carries_its_gnu_citation_and_disposition() {
     assert_eq!(
         HandledSignal::COUNT,
@@ -156,6 +164,7 @@ fn every_handled_signal_carries_its_gnu_citation_and_disposition() {
 /// (src/keyboard.c:8487-8508).  Here that comparison runs on the Lisp thread
 /// at the safe point, because BOTH arms touch Lisp state.
 #[test]
+#[cfg(unix)]
 fn debug_on_event_selects_the_debugger_arm_by_name_like_gnu() {
     // `debug-on-event' defaults to `sigusr2' (src/keyboard.c:14358-14367).
     assert_eq!(
@@ -201,6 +210,7 @@ fn debug_on_event_selects_the_debugger_arm_by_name_like_gnu() {
 /// `:984`, `:6340`, `:6359`, and `sys::poll_child_status`), three of them
 /// through `std::process::Child`.
 #[test]
+#[cfg(unix)]
 fn a_second_reaper_takes_the_exit_status_the_owner_would_have_reported() {
     let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")
@@ -248,6 +258,7 @@ fn a_second_reaper_takes_the_exit_status_the_owner_would_have_reported() {
 /// noticed through `epoll_wait`'s EINTR (which signal(7) says is never
 /// restarted) rather than through a readable fd.
 #[test]
+#[cfg(unix)]
 fn the_handler_has_gnus_self_pipe_and_it_carries_a_byte() {
     let report = os_signal::install();
     let read_fd = report
@@ -286,6 +297,7 @@ fn the_handler_has_gnus_self_pipe_and_it_carries_a_byte() {
 /// be an atomic -- and an atomic that fell back to a lock would put a lock in
 /// signal context, which is exactly the state this module exists to exclude.
 #[test]
+#[cfg(unix)]
 fn the_pending_counters_are_lock_free() {
     // `Atomic*::is_lock_free` is still unstable, and `target_has_atomic` is
     // the stable spelling of the same fact: rustc sets it only for widths the
@@ -301,4 +313,17 @@ fn the_pending_counters_are_lock_free() {
         "AtomicBool is not native on this target, so the pending-signal flag \
          would take a lock in signal context"
     );
+}
+
+/// Windows has no POSIX SIGUSR dispositions, so this module must expose no
+/// signal entries and must not create an install-time wake mechanism.
+#[cfg(windows)]
+#[test]
+fn windows_does_not_advertise_or_install_user_signals() {
+    assert!(HandledSignal::ALL.is_empty());
+
+    let report = os_signal::install();
+    assert_eq!(report.installed_count(), 0);
+    assert_eq!(report.self_pipe_read_fd(), None);
+    assert!(!os_signal::pending());
 }

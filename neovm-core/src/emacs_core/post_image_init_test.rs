@@ -148,11 +148,19 @@ fn post_image_init_screened_sites_carry_their_evidence() {
                     "{} claims no Lisp-visible state without evidence",
                     site.site().c_name
                 );
-                assert!(
-                    !installs.is_empty(),
-                    "{} claims to install dispositions but names none",
-                    site.site().c_name
-                );
+                if cfg!(unix) {
+                    assert!(
+                        !installs.is_empty(),
+                        "{} claims to install dispositions but names none",
+                        site.site().c_name
+                    );
+                } else {
+                    assert!(
+                        installs.is_empty(),
+                        "{} has no supported signal dispositions on this platform",
+                        site.site().c_name
+                    );
+                }
                 os_dispositions += 1;
             }
             Establishes::Facts { constants, derived } => {
