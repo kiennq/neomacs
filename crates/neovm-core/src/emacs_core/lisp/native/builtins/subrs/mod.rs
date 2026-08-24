@@ -3975,7 +3975,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ));
     ctx.register_subr(SubrSpec::new(
         "daemon-initialized",
-        NativeFn::ContextVec(|_ctx, args| builtin_daemon_initialized(args)),
+        NativeFn::ContextVec(|ctx, args| builtin_daemon_initialized(ctx, args)),
         SubrArity::new(0, Some(0)),
     ));
     ctx.register_subr(SubrSpec::new(

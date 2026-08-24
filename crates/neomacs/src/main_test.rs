@@ -1,3 +1,4 @@
+use super::daemon;
 use super::frame_layout::{
     REDISPLAY_RUNTIME, current_layout_frame_id,
     install_tty_redisplay_callback as maybe_install_tty_redisplay_callback,
@@ -73,10 +74,11 @@ use neovm_core::window::{
     FrameFullscreen, FrameId, FrameParam, GuiFrameGeometryHints, WindowId,
     default_gui_tool_bar_line_height,
 };
+use std::ffi::OsString;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 fn gui_display() -> BootstrapDisplayConfig {
@@ -1661,13 +1663,83 @@ fn runtime_mode_binary_names_match_gnu_shaped_roles() {
 #[cfg(windows)]
 fn windows_gui_logging_is_opt_in_with_rust_log() {
     assert_eq!(
-        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, false),
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, false, false),
         neovm_core::logging::LogTarget::File
     );
     assert_eq!(
-        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, true),
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, true, false),
         neovm_core::logging::LogTarget::Stdout
     );
+}
+
+#[test]
+fn daemon_logging_always_uses_file_target() {
+    assert_eq!(
+        log_target_for(RuntimeMode::FinalRun, FrontendKind::Gui, true, true),
+        neovm_core::logging::LogTarget::File
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn server_socket_environment_preserves_explicit_override() {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    assert_eq!(
+        super::server_socket_env_value(
+            Some(OsStr::new("C:\\user-selected")),
+            Path::new("C:\\prepared"),
+        ),
+        OsStr::new("C:\\user-selected")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn server_socket_environment_uses_prepared_directory_without_override() {
+    use std::path::Path;
+
+    assert_eq!(
+        super::server_socket_env_value(None, Path::new("C:\\prepared")),
+        std::ffi::OsStr::new("C:\\prepared")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn server_socket_environment_replaces_empty_override() {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    assert_eq!(
+        super::server_socket_env_value(Some(OsStr::new("")), Path::new("C:\\prepared")),
+        OsStr::new("C:\\prepared")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn server_socket_startup_configuration_only_selects_directory() {
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let root = tempdir().unwrap();
+    let selected = root.path().join("selected");
+    let old_override = std::env::var_os("NEOMACS_SERVER_SOCKET_DIR");
+    unsafe {
+        std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", &selected);
+    }
+
+    assert!(super::configure_server_socket_directory().is_ok());
+    assert!(!selected.exists());
+
+    match old_override {
+        Some(value) => unsafe { std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", value) },
+        None => unsafe { std::env::remove_var("NEOMACS_SERVER_SOCKET_DIR") },
+    }
 }
 
 #[test]
@@ -1742,11 +1814,14 @@ fn bootstrap_gui_frame_uses_gnu_cursor_and_pointer_color_defaults() {
 }
 
 fn gui_startup() -> StartupOptions {
+    let forwarded_args = vec!["neomacs".to_string(), "-Q".to_string()];
     StartupOptions {
         frontend: FrontendKind::Gui,
-        forwarded_args: vec!["neomacs".to_string(), "-Q".to_string()],
+        forwarded_args: forwarded_args.clone(),
+        raw_args: forwarded_args.into_iter().map(OsString::from).collect(),
         terminal_device: None,
         noninteractive: false,
+        daemon: None,
         temacs_mode: None,
         dump_file_override: None,
         no_site_lisp: true,
@@ -1760,9 +1835,11 @@ fn gui_startup_with_args(args: &[&str]) -> StartupOptions {
     forwarded_args.extend(args.iter().map(|arg| (*arg).to_string()));
     StartupOptions {
         frontend: FrontendKind::Gui,
+        raw_args: forwarded_args.iter().cloned().map(OsString::from).collect(),
         forwarded_args,
         terminal_device: None,
         noninteractive: false,
+        daemon: None,
         temacs_mode: None,
         dump_file_override: None,
         no_site_lisp: false,
@@ -1776,9 +1853,11 @@ fn tty_batch_startup_with_args(args: &[&str]) -> StartupOptions {
     forwarded_args.extend(args.iter().map(|arg| (*arg).to_string()));
     StartupOptions {
         frontend: FrontendKind::Tty,
+        raw_args: forwarded_args.iter().cloned().map(OsString::from).collect(),
         forwarded_args,
         terminal_device: None,
         noninteractive: true,
+        daemon: None,
         temacs_mode: None,
         dump_file_override: None,
         no_site_lisp: false,
@@ -1804,6 +1883,113 @@ fn parse_startup_options_accepts_gnu_temacs_modes() {
     ])
     .expect("startup options should parse");
     assert_eq!(startup.temacs_mode, Some(LoadupDumpMode::Pdump));
+}
+
+#[test]
+fn parse_startup_options_parses_daemon_options_and_consumes_them() {
+    let cases = [
+        (
+            vec!["neomacs", "--daemon"],
+            neovm_core::emacs_core::daemon::DaemonRequest::Background { name: None },
+        ),
+        (
+            vec!["neomacs", "--bg-daemon"],
+            neovm_core::emacs_core::daemon::DaemonRequest::Background { name: None },
+        ),
+        (
+            vec!["neomacs", "--fg-daemon"],
+            neovm_core::emacs_core::daemon::DaemonRequest::Foreground { name: None },
+        ),
+        (
+            vec!["neomacs", "--bg-daemon=work"],
+            neovm_core::emacs_core::daemon::DaemonRequest::Background {
+                name: Some("work".into()),
+            },
+        ),
+        (
+            vec!["neomacs", "--fg-daemon=work"],
+            neovm_core::emacs_core::daemon::DaemonRequest::Foreground {
+                name: Some("work".into()),
+            },
+        ),
+    ];
+
+    for (argv, expected) in cases {
+        let raw_args = argv.iter().cloned().map(OsString::from).collect::<Vec<_>>();
+        let startup = parse_startup_options(argv.into_iter().map(String::from))
+            .expect("daemon options should parse");
+        assert_eq!(startup.daemon, Some(expected));
+        assert_eq!(startup.raw_args, raw_args);
+        assert!(
+            startup.forwarded_args.len() == 1,
+            "daemon options must be consumed: {:?}",
+            startup.forwarded_args
+        );
+    }
+}
+
+#[test]
+fn parse_startup_options_rejects_daemon_option_with_batch_script_or_no_window_system() {
+    for args in [
+        vec!["--daemon", "--batch"],
+        vec!["--batch", "--daemon"],
+        vec!["--daemon", "--script", "init.el"],
+        vec!["--script", "init.el", "--daemon"],
+        vec!["--daemon", "-nw"],
+        vec!["-nw", "--daemon"],
+    ] {
+        let err = parse_startup_options(
+            std::iter::once("neomacs".to_string()).chain(args.into_iter().map(String::from)),
+        )
+        .expect_err("incompatible daemon options should be rejected");
+        assert!(
+            err.contains("daemon"),
+            "expected daemon validation error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn parse_startup_options_rejects_multiple_daemon_options_in_any_order() {
+    for args in [
+        vec!["--daemon", "--bg-daemon"],
+        vec!["--bg-daemon", "--daemon"],
+        vec!["--daemon", "--daemon"],
+        vec!["--fg-daemon=work", "--daemon"],
+    ] {
+        let err = parse_startup_options(
+            std::iter::once("neomacs".to_string()).chain(args.into_iter().map(String::from)),
+        )
+        .expect_err("multiple daemon options should be rejected");
+        assert!(
+            err.contains("daemon"),
+            "expected daemon validation error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn foreground_daemon_prepare_continues_in_the_current_process() {
+    let startup = StartupOptions {
+        frontend: FrontendKind::Gui,
+        forwarded_args: vec!["neomacs".to_string()],
+        raw_args: vec![OsString::from("neomacs")],
+        terminal_device: None,
+        noninteractive: false,
+        daemon: Some(neovm_core::emacs_core::daemon::DaemonRequest::Foreground {
+            name: Some("work".to_string()),
+        }),
+        temacs_mode: None,
+        dump_file_override: None,
+        no_site_lisp: false,
+        no_loadup: false,
+        no_build_details: false,
+    };
+
+    assert_eq!(
+        daemon::prepare(startup.clone()).unwrap(),
+        daemon::DaemonLaunch::Continue(startup)
+    );
 }
 
 #[test]
@@ -2201,6 +2387,189 @@ fn eval_after_gnu_gui_startup(source: &str) -> String {
     print_value_with_eval(&mut eval, &result)
 }
 
+static DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(super) fn daemon_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    DAEMON_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct DaemonTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn daemon_test_guard() -> DaemonTestGuard {
+    let lock = daemon_test_lock();
+    neovm_core::emacs_core::daemon::configure(None).expect("daemon state should be clear");
+    DaemonTestGuard { _lock: lock }
+}
+
+fn configure_foreground_daemon_gui_startup(eval: &mut Context, frame_id: FrameId) {
+    let startup = StartupOptions {
+        frontend: FrontendKind::Gui,
+        forwarded_args: vec!["neomacs".to_string()],
+        raw_args: vec![OsString::from("neomacs")],
+        terminal_device: None,
+        noninteractive: false,
+        daemon: Some(neovm_core::emacs_core::daemon::DaemonRequest::Foreground { name: None }),
+        temacs_mode: None,
+        dump_file_override: None,
+        no_site_lisp: false,
+        no_loadup: false,
+        no_build_details: false,
+    };
+    configure_gnu_startup_state(eval, frame_id, &startup);
+    eval.eval_str("(put 'neo 'window-system-initialized t)")
+        .expect("mark test window system initialized");
+}
+
+impl Drop for DaemonTestGuard {
+    fn drop(&mut self) {
+        neovm_core::emacs_core::daemon::configure(None).expect("daemon state should reset");
+    }
+}
+
+#[test]
+fn daemon_startup_frame_uses_visible_terminal_bootstrap_topology() {
+    let _daemon_guard = daemon_test_guard();
+    neovm_core::emacs_core::daemon::configure(Some(
+        neovm_core::emacs_core::daemon::DaemonRequest::Foreground { name: None },
+    ))
+    .expect("daemon startup should configure");
+
+    let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
+        .expect("bootstrap evaluator");
+    let frame_id = bootstrap_runtime_gui_frame(&mut eval);
+    let startup = StartupOptions {
+        frontend: FrontendKind::Gui,
+        forwarded_args: vec!["neomacs".to_string()],
+        raw_args: vec![OsString::from("neomacs")],
+        terminal_device: None,
+        noninteractive: false,
+        daemon: Some(neovm_core::emacs_core::daemon::DaemonRequest::Foreground { name: None }),
+        temacs_mode: None,
+        dump_file_override: None,
+        no_site_lisp: false,
+        no_loadup: false,
+        no_build_details: false,
+    };
+    configure_gnu_startup_state(&mut eval, frame_id, &startup);
+
+    let result = eval
+        .eval_str(
+            "(list (daemonp)
+                   (= (length (frame-list)) 1)
+                   (eq (selected-frame) terminal-frame)
+                   (frame-visible-p terminal-frame)
+                   (window-system terminal-frame)
+                   window-system
+                   initial-window-system
+                   frame-initial-frame
+                   default-minibuffer-frame)",
+        )
+        .expect("daemon startup topology should evaluate");
+    let result = print_value_with_eval(&mut eval, &result);
+    assert_eq!(result, "(t t t t nil nil nil nil nil)");
+}
+
+#[test]
+fn foreground_daemon_first_gui_frame_reuses_bootstrap_font_size() {
+    let _daemon_guard = daemon_test_guard();
+    neovm_core::emacs_core::daemon::configure(Some(
+        neovm_core::emacs_core::daemon::DaemonRequest::Foreground { name: None },
+    ))
+    .expect("daemon startup should configure");
+
+    let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
+        .expect("bootstrap evaluator");
+    let frame_id = bootstrap_runtime_gui_frame(&mut eval);
+    configure_foreground_daemon_gui_startup(&mut eval, frame_id);
+    // Avoid opening a real display; the frame-creation and face-realization
+    // path below is the same one used by `neomacsclient -c`.
+    let result = eval
+        .eval_str(
+            "(let* ((frame (make-frame '((window-system . neo))))
+                    (second (make-frame '((window-system . neo)))))
+               (list (face-attribute 'default :height frame)
+                     (face-attribute 'default :height terminal-frame)
+                     (face-attribute 'default :height second)
+                     (frame-char-height frame)))",
+        )
+        .expect("daemon client frame should evaluate");
+    assert_eq!(
+        print_value_with_eval(&mut eval, &result),
+        "(100 1 100 15)",
+        "both daemon GUI frames must use the retained bootstrap font while the daemon frame remains terminal-like",
+    );
+}
+
+#[test]
+fn foreground_daemon_first_gui_frame_preserves_default_face_height() {
+    let _daemon_guard = daemon_test_guard();
+    neovm_core::emacs_core::daemon::configure(Some(
+        neovm_core::emacs_core::daemon::DaemonRequest::Foreground { name: None },
+    ))
+    .expect("daemon startup should configure");
+
+    let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
+        .expect("bootstrap evaluator");
+    let frame_id = bootstrap_runtime_gui_frame(&mut eval);
+    configure_foreground_daemon_gui_startup(&mut eval, frame_id);
+    let result = eval
+        .eval_str(
+            "(let ((old (face-attribute 'default :height t)))
+               (unwind-protect
+                   (progn
+                     (set-face-attribute 'default t :height 150)
+                     (let ((frame (make-frame '((window-system . neo)))))
+                       (face-attribute 'default :height frame)))
+                 (set-face-attribute 'default t :height old)))",
+        )
+        .expect("explicit default face height should evaluate");
+    assert_eq!(
+        print_value_with_eval(&mut eval, &result),
+        "150",
+        "frame creation must preserve an explicit default-face height",
+    );
+}
+
+#[test]
+fn explicit_gui_frame_font_overrides_bootstrap_font() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
+        .expect("bootstrap evaluator");
+    let _frame_id = bootstrap_runtime_gui_startup(&mut eval);
+    eval.eval_str("(put 'neo 'window-system-initialized t)")
+        .expect("mark test window system initialized");
+    let result = eval
+        .eval_str(
+            "(let ((frame (make-frame '((window-system . neo)
+                                        (font . \"Monospace-20\")))))
+               (face-attribute 'default :height frame))",
+        )
+        .expect("explicit frame font should evaluate");
+    assert_eq!(print_value_with_eval(&mut eval, &result), "200");
+}
+
+#[test]
+fn non_daemon_second_gui_frame_reuses_bootstrap_font_size() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
+        .expect("bootstrap evaluator");
+    let _frame_id = bootstrap_runtime_gui_startup(&mut eval);
+    eval.eval_str("(put 'neo 'window-system-initialized t)")
+        .expect("mark test window system initialized");
+    let result = eval
+        .eval_str(
+            "(let* ((first (make-frame '((window-system . neo))))
+                    (second (make-frame '((window-system . neo)))))
+               (list (face-attribute 'default :height first)
+                     (face-attribute 'default :height second)))",
+        )
+        .expect("non-daemon GUI frames should evaluate");
+    assert_eq!(print_value_with_eval(&mut eval, &result), "(100 100)");
+}
+
 #[test]
 fn bootstrap_buffers_realize_default_face_from_frame_font_parameter() {
     let mut eval = create_bootstrap_evaluator_with_features(BOOTSTRAP_CORE_FEATURES)
@@ -2391,23 +2760,59 @@ fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows()
         terminal_state: super::TerminalHostState::new(new_shared_terminals()),
     };
 
-    neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000002))
-        .expect("destroy secondary frame");
     neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000001))
         .expect("destroy primary frame");
+    assert_eq!(host.primary_frame_id, None);
+    neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000002))
+        .expect("destroy secondary frame");
+    neovm_core::emacs_core::DisplayHost::realize_gui_frame(
+        &mut host,
+        GuiFrameHostRequest {
+            frame_id: FrameId(0x100000003),
+            width: 960,
+            height: 640,
+            title: LispString::from_utf8("recreated"),
+            geometry_hints: GuiFrameGeometryHints {
+                base_width: 24,
+                base_height: 16,
+                min_width: 24,
+                min_height: 16,
+                width_inc: 8,
+                height_inc: 16,
+            },
+            fullscreen: None,
+        },
+    )
+    .expect("realize recreated daemon frame");
+    assert_eq!(host.primary_frame_id, None);
+    neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000003))
+        .expect("destroy recreated frame");
 
     let commands: Vec<_> = cmd_rx.try_iter().collect();
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 4);
     assert!(matches!(
         commands[0],
         RenderCommand::Window(WindowCommand::DestroyWindow {
-            frame: FrameRef::Frame(0x100000002),
+            frame: FrameRef::Frame(0x100000001),
         })
     ));
     assert!(matches!(
         commands[1],
         RenderCommand::Window(WindowCommand::DestroyWindow {
-            frame: FrameRef::Primary
+            frame: FrameRef::Frame(0x100000002)
+        })
+    ));
+    assert!(matches!(
+        commands[2],
+        RenderCommand::Window(WindowCommand::CreateWindow {
+            frame: FrameRef::Frame(0x100000003),
+            ..
+        })
+    ));
+    assert!(matches!(
+        commands[3],
+        RenderCommand::Window(WindowCommand::DestroyWindow {
+            frame: FrameRef::Frame(0x100000003)
         })
     ));
     assert_eq!(host.primary_frame_id, None);
@@ -4221,8 +4626,10 @@ fn configure_gnu_startup_state_clears_window_system_for_tty_boots() {
     let startup = StartupOptions {
         frontend: FrontendKind::Tty,
         forwarded_args: vec!["neomacs".to_string(), "-q".to_string()],
+        raw_args: vec![OsString::from("neomacs"), OsString::from("-q")],
         terminal_device: Some("/dev/tty".to_string()),
         noninteractive: false,
+        daemon: None,
         temacs_mode: None,
         dump_file_override: None,
         no_site_lisp: false,
@@ -4323,8 +4730,10 @@ fn live_tty_defface_keeps_dark_color_parent_attributes_through_inverse_video() {
     let startup = StartupOptions {
         frontend: FrontendKind::Tty,
         forwarded_args: vec!["neomacs".to_string(), "-Q".to_string()],
+        raw_args: vec![OsString::from("neomacs"), OsString::from("-Q")],
         terminal_device: None,
         noninteractive: false,
+        daemon: None,
         temacs_mode: None,
         dump_file_override: None,
         no_site_lisp: true,
@@ -4404,8 +4813,15 @@ fn configure_gnu_startup_state_marks_batch_mode_noninteractive() {
             "--eval".to_string(),
             "(princ 1)".to_string(),
         ],
+        raw_args: vec![
+            OsString::from("neomacs"),
+            OsString::from("-Q"),
+            OsString::from("--eval"),
+            OsString::from("(princ 1)"),
+        ],
         terminal_device: None,
         noninteractive: true,
+        daemon: None,
         temacs_mode: None,
         dump_file_override: None,
         no_site_lisp: false,

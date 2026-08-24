@@ -1,7 +1,7 @@
 //! Window and chrome render commands.
 
 use super::RenderApp;
-use crate::thread_comm::{InputEvent, WindowCommand};
+use crate::thread_comm::{FrameRef, InputEvent, WindowCommand};
 use winit::dpi::PhysicalPosition;
 use winit::window::{CursorIcon, UserAttentionType};
 
@@ -76,11 +76,6 @@ impl RenderApp {
                 }
             }
             WindowCommand::SetWindowTitle { title } => {
-                self.frame_windows
-                    .primary_window_mut()
-                    .expect("primary window state")
-                    .chrome_mut()
-                    .title = title.clone();
                 if let Some(primary_state) = self.frame_windows.primary_window_mut() {
                     primary_state.set_title(title);
                     if !primary_state.chrome().decorations_enabled {
@@ -88,23 +83,27 @@ impl RenderApp {
                     }
                 }
             }
-            WindowCommand::SetFrameWindowTitle { frame, title } => {
-                let emacs_frame_id = frame.raw_id();
-                if let Some(window_state) = self.frame_windows.get_mut(emacs_frame_id) {
-                    window_state.set_title(title);
-                } else if self.frame_windows.is_primary_frame_id(emacs_frame_id) {
-                    self.frame_windows
-                        .primary_window_mut()
-                        .expect("primary window state")
-                        .chrome_mut()
-                        .title = title;
-                } else {
-                    tracing::warn!(
-                        "SetFrameWindowTitle requested for unknown frame_id=0x{:x}",
-                        emacs_frame_id
-                    );
+            WindowCommand::SetFrameWindowTitle { frame, title } => match frame {
+                FrameRef::Primary => {
+                    if let Some(window_state) = self.frame_windows.primary_window_mut() {
+                        window_state.set_title(title);
+                    } else {
+                        tracing::warn!(
+                            "SetFrameWindowTitle requested for primary without window state"
+                        );
+                    }
                 }
-            }
+                FrameRef::Frame(emacs_frame_id) => {
+                    if let Some(window_state) = self.frame_windows.get_mut(emacs_frame_id) {
+                        window_state.set_title(title);
+                    } else {
+                        tracing::warn!(
+                            "SetFrameWindowTitle requested for unknown frame_id=0x{:x}",
+                            emacs_frame_id
+                        );
+                    }
+                }
+            },
             WindowCommand::SetWindowFullscreen { frame, mode } => {
                 let emacs_frame_id = frame.raw_id();
                 if let Some(window_state) = self.frame_windows.get_mut(emacs_frame_id) {
@@ -186,11 +185,9 @@ impl RenderApp {
                 }
             }
             WindowCommand::SetWindowDecorated { decorated } => {
-                self.frame_windows
-                    .primary_window_mut()
-                    .expect("primary window state")
-                    .chrome_mut()
-                    .decorations_enabled = decorated;
+                if let Some(primary) = self.frame_windows.primary_window_mut() {
+                    primary.chrome_mut().decorations_enabled = decorated;
+                }
                 self.frame_windows.set_top_level_decorations(decorated);
             }
             WindowCommand::RequestAttention { urgent } => {
@@ -222,16 +219,35 @@ impl RenderApp {
                     height,
                     title
                 );
-                self.frame_windows.request_create(
-                    emacs_frame_id,
-                    width,
-                    height,
-                    title,
-                    geometry_hints,
-                );
+                if self.lifecycle_flags.daemon_mode && self.frame_windows.primary_window().is_none()
+                {
+                    self.frame_windows.set_primary_pending_request(
+                        emacs_frame_id,
+                        width,
+                        height,
+                        title,
+                        geometry_hints,
+                    );
+                    self.lifecycle_flags.primary_deferred = false;
+                    self.lifecycle_flags.primary_realization_requested = true;
+                } else {
+                    self.frame_windows.request_create(
+                        emacs_frame_id,
+                        width,
+                        height,
+                        title,
+                        geometry_hints,
+                    );
+                }
             }
             WindowCommand::DestroyWindow { frame } => {
-                let emacs_frame_id = frame.raw_id();
+                let FrameRef::Frame(emacs_frame_id) = frame else {
+                    tracing::warn!(
+                        "DestroyWindow ignored stale primary route {:?}; exact frame ID required",
+                        frame
+                    );
+                    return;
+                };
                 tracing::info!("DestroyWindow request: frame_id=0x{:x}", emacs_frame_id);
                 let mut retirements = Vec::new();
                 if let Some(window) = self.frame_windows.get_mut(emacs_frame_id) {
@@ -256,9 +272,16 @@ impl RenderApp {
                     self.comms
                         .send_input(InputEvent::PresentationRetired { presentation });
                 }
-                if self.frame_windows.is_primary_frame_id(emacs_frame_id) {
+                if self.frame_windows.primary_frame_id() == Some(emacs_frame_id) {
                     self.frame_windows.take_primary_window();
                     self.frame_windows.clear_primary_mapping();
+                    if self.lifecycle_flags.daemon_mode {
+                        self.lifecycle_flags.primary_deferred = self
+                            .frame_windows
+                            .promote_active_secondary_to_primary()
+                            .is_none();
+                        self.lifecycle_flags.shutdown_requested = false;
+                    }
                 } else {
                     self.frame_windows.request_destroy(emacs_frame_id);
                 }

@@ -286,11 +286,16 @@ If nil, no instructions are displayed."
   (if internal--daemon-sockname
       (file-name-directory internal--daemon-sockname)
     (and (featurep 'make-network-process '(:family local))
-	 (let ((runtime-dir (getenv "XDG_RUNTIME_DIR")))
-	   (if runtime-dir
-	       (expand-file-name "emacs" runtime-dir)
-	     (expand-file-name (format "emacs%d" (user-uid))
-                               (or (getenv "TMPDIR") "/tmp"))))))
+	 (if (eq system-type 'windows-nt)
+	     (let ((socket-dir (getenv "NEOMACS_SERVER_SOCKET_DIR")))
+	       (and socket-dir
+		    (> (length socket-dir) 0)
+		    socket-dir))
+	   (let ((runtime-dir (getenv "XDG_RUNTIME_DIR")))
+	     (if runtime-dir
+		 (expand-file-name "emacs" runtime-dir)
+	       (expand-file-name (format "emacs%d" (user-uid))
+                                 (or (getenv "TMPDIR") "/tmp")))))))
   "The directory in which to place the server socket.
 If local sockets are not supported, this is nil.")
 
@@ -701,6 +706,15 @@ To force-start a server, do \\[server-force-delete] and then
 To check from a Lisp program whether a server is running, use
 the `server-process' variable."
   (interactive "P")
+  (when (and (eq system-type 'windows-nt)
+             (not server-use-tcp)
+             (featurep 'make-network-process '(:family local))
+             (null server-socket-dir))
+    (setq server-use-tcp t)
+    (display-warning
+     'server
+     "Local server socket directory is unavailable; using TCP instead."
+     :warning))
   (when (or (not server-clients)
 	    ;; Ask the user before deleting existing clients---except
 	    ;; when we can't get user input, which may happen when
@@ -751,7 +765,10 @@ the `server-process' variable."
     (unless leave-dead
       (let ((server-file (server--file-name)))
 	;; Make sure there is a safe directory in which to place the socket.
-	(server-ensure-safe-dir (file-name-directory server-file))
+	(unless (and (eq system-type 'windows-nt)
+		     (not server-use-tcp)
+		     (not (file-exists-p (file-name-directory server-file))))
+	  (server-ensure-safe-dir (file-name-directory server-file)))
         (with-file-modes ?\700
 	  (add-hook 'suspend-tty-functions #'server-handle-suspend-tty)
 	  (add-hook 'delete-frame-functions #'server-handle-delete-frame)
@@ -844,23 +861,26 @@ This function can return non-nil if the server was started by some other
 Emacs process.  To check from a Lisp program whether a server was started
 by the current Emacs process, use the `server-process' variable."
   (unless name (setq name server-name))
-  (condition-case nil
-      (if server-use-tcp
-	  (with-temp-buffer
-            (setq default-directory server-auth-dir)
-	    (insert-file-contents-literally (expand-file-name name))
-	    (or (and (looking-at "127\\.0\\.0\\.1:[0-9]+ \\([0-9]+\\)")
-		     (assq 'comm
-			   (process-attributes
-			    (string-to-number (match-string 1))))
-		     t)
-		:other))
-	(delete-process
-	 (make-network-process
-	  :name "server-client-test" :family 'local :server nil :noquery t
-	  :service (expand-file-name name server-socket-dir)))
-	t)
-    (file-error nil)))
+  (let ((server-dir (if server-use-tcp server-auth-dir server-socket-dir)))
+    (if (null server-dir)
+	nil
+      (condition-case nil
+	  (if server-use-tcp
+	      (with-temp-buffer
+                (setq default-directory server-auth-dir)
+	        (insert-file-contents-literally (expand-file-name name))
+	        (or (and (looking-at "127\\.0\\.0\\.1:[0-9]+ \\([0-9]+\\)")
+		         (assq 'comm
+			       (process-attributes
+			        (string-to-number (match-string 1))))
+		         t)
+		    :other))
+	    (delete-process
+	     (make-network-process
+	      :name "server-client-test" :family 'local :server nil :noquery t
+	      :service (expand-file-name name server-dir)))
+	    t)
+	(file-error nil)))))
 
 ;; This keymap is empty, but allows users to define keybindings to use
 ;; when `server-mode' is active.
@@ -2057,10 +2077,12 @@ This function signals `server-return-invalid-read-syntax' if
 This will occur whenever the result of evaluating FORM is
 something that cannot be printed readably."
   (let* ((server-dir (if server-use-tcp server-auth-dir server-socket-dir))
-         (server-file (expand-file-name server server-dir))
+         (server-file (and server-dir (expand-file-name server server-dir)))
          (coding-system-for-read 'binary)
          (coding-system-for-write 'binary)
          address port secret process)
+    (unless server-dir
+      (error "No server socket directory"))
     (unless (file-exists-p server-file)
       (error "No such server: %s" server))
     (with-temp-buffer

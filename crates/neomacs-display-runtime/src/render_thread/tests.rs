@@ -1,6 +1,9 @@
 use super::RenderApp;
 use super::render_quality::RenderBackendProfile;
-use super::state::GuiChromeInteractionState;
+use super::state::{
+    DeviceRecoveryTarget, GuiChromeInteractionState, PrimaryGpuInitialization, RenderStartupMode,
+    device_recovery_target, primary_gpu_initialization_plan,
+};
 use crate::core::frame_glyphs::FrameGlyphBuffer;
 use crate::core::types::DisplayWindowId;
 use crate::thread_comm::{
@@ -176,6 +179,123 @@ fn removing_frame_shader_leaves_one_unshaded_repaint_demand() {
             .dirty,
         "shader removal must repaint once after retracting its continuous demand"
     );
+}
+
+#[test]
+fn deferred_primary_starts_without_realization_request() {
+    let state = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+
+    assert!(state.frame_windows.primary_window().is_none());
+    assert!(state.gpu.is_none());
+    assert!(!state.lifecycle_flags.primary_realization_requested);
+}
+
+#[test]
+fn installing_first_daemon_primary_arms_one_realization_attempt() {
+    let mut state = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+    state.install_first_client_as_primary(42);
+
+    assert!(state.lifecycle_flags.primary_realization_requested);
+    assert!(
+        !state
+            .frame_windows
+            .primary_window()
+            .expect("installed primary remains present")
+            .lifecycle
+            .is_active()
+    );
+    assert!(state.take_primary_realization_request());
+    assert!(!state.take_primary_realization_request());
+}
+
+#[test]
+fn replacing_failed_pending_primary_arms_one_new_realization_attempt() {
+    let mut state = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+    state.install_first_client_as_primary(42);
+
+    assert!(state.take_primary_realization_request());
+    assert!(!state.take_primary_realization_request());
+    assert!(state.handle_daemon_primary_destroyed(42));
+
+    state.install_first_client_as_primary(43);
+
+    assert!(state.take_primary_realization_request());
+    assert!(!state.take_primary_realization_request());
+}
+
+#[test]
+fn immediate_primary_leaves_about_to_wait_realization_unarmed() {
+    let state = RenderApp::new_for_test(RenderStartupMode::ImmediatePrimary);
+
+    assert!(
+        !state
+            .frame_windows
+            .primary_window()
+            .expect("immediate startup has a pending primary")
+            .lifecycle
+            .is_active()
+    );
+    assert!(!state.lifecycle_flags.primary_realization_requested);
+}
+
+#[test]
+fn primary_gpu_realization_counter_seam_distinguishes_first_and_reused_primary() {
+    let mut state = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+
+    let first = primary_gpu_initialization_plan(false, false, false);
+    assert_eq!(first, PrimaryGpuInitialization::Initialize);
+    state.record_primary_gpu_initialization(first);
+
+    let second = primary_gpu_initialization_plan(true, true, false);
+    assert_eq!(second, PrimaryGpuInitialization::Reuse);
+    state.record_primary_gpu_initialization(second);
+
+    assert_eq!(state.full_gpu_initializations, 1);
+    assert_eq!(state.primary_surface_creations, 2);
+}
+
+#[test]
+fn device_recovery_target_uses_surviving_secondary_before_deferring() {
+    assert_eq!(
+        device_recovery_target(false, false),
+        DeviceRecoveryTarget::Deferred
+    );
+    assert_eq!(
+        device_recovery_target(false, true),
+        DeviceRecoveryTarget::SurvivingSecondary
+    );
+    assert_eq!(
+        device_recovery_target(true, true),
+        DeviceRecoveryTarget::Primary
+    );
+}
+
+#[test]
+fn daemon_primary_destroy_rearms_without_shutdown() {
+    let mut state = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+
+    state.install_first_client_as_primary(42);
+    state.handle_daemon_primary_destroyed(42);
+
+    assert!(state.frame_windows.primary_window().is_none());
+    assert!(state.frame_windows.primary_frame_id().is_none());
+    assert!(state.lifecycle_flags.primary_deferred);
+    assert!(!state.lifecycle_flags.shutdown_requested);
+}
+
+#[test]
+fn daemon_primary_recreation_replaces_the_frame_mapping() {
+    let mut state = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+
+    state.install_first_client_as_primary(42);
+    state.handle_daemon_primary_destroyed(42);
+    state.install_first_client_as_primary(43);
+
+    assert_eq!(state.frame_windows.primary_frame_id(), Some(43));
+    assert!(state.frame_windows.primary_window().is_some());
+    assert!(state.frame_windows.winit_to_emacs.is_empty());
+    assert_eq!(state.full_gpu_initializations, 0);
+    assert_eq!(state.primary_surface_creations, 0);
 }
 
 #[test]
@@ -663,7 +783,7 @@ fn destroy_primary_window_command_prevents_lifecycle_recreate() {
     app.frame_windows.adopt_primary_frame_id(0x1000);
 
     app.handle_window(WindowCommand::DestroyWindow {
-        frame: FrameRef::Primary,
+        frame: FrameRef::Frame(0x1000),
     });
 
     assert!(app.frame_windows.primary_window().is_none());
@@ -686,6 +806,37 @@ fn destroy_primary_window_command_prevents_lifecycle_recreate() {
     );
     assert!(app.frame_windows.primary_window().is_none());
     assert_eq!(app.frame_windows.primary_frame_id(), None);
+}
+
+#[test]
+fn frame_title_command_without_primary_is_ignored_without_panicking() {
+    let mut app = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+
+    app.handle_window(WindowCommand::SetFrameWindowTitle {
+        frame: FrameRef::Primary,
+        title: "late title".to_owned(),
+    });
+
+    assert!(app.frame_windows.primary_window().is_none());
+}
+
+#[test]
+fn stale_primary_destroy_cannot_remove_newly_adopted_primary() {
+    let mut app = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+    app.install_first_client_as_primary(0xA);
+    assert!(app.handle_daemon_primary_destroyed(0xA));
+    app.install_first_client_as_primary(0xC);
+
+    app.handle_window(WindowCommand::DestroyWindow {
+        frame: FrameRef::Frame(0xA),
+    });
+    app.handle_window(WindowCommand::DestroyWindow {
+        frame: FrameRef::Primary,
+    });
+
+    assert_eq!(app.frame_windows.primary_frame_id(), Some(0xC));
+    assert!(app.frame_windows.primary_window().is_some());
+    assert_eq!(app.frame_windows.pending_destroys, vec![0xA]);
 }
 
 #[test]

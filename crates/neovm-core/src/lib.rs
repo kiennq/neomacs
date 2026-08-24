@@ -11,6 +11,7 @@ pub mod gc_trace;
 pub mod heap_types;
 pub mod keyboard;
 mod keyboard_input;
+pub mod local_socket;
 pub mod logging;
 pub mod tagged;
 #[cfg(test)]

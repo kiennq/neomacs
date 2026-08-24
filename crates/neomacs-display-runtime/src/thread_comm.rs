@@ -353,7 +353,10 @@ pub enum WindowCommand {
     },
     /// Associate the already-created primary OS window with its real Emacs frame ID.
     AdoptPrimaryFrame { frame: FrameRef },
-    /// Destroy an OS window for a top-level Emacs frame
+    /// Destroy an OS window for an exact top-level Emacs frame ID.
+    ///
+    /// `FrameRef::Primary` is intentionally rejected by the render thread:
+    /// destruction must not resolve a stale primary route to a newer frame.
     DestroyWindow { frame: FrameRef },
     /// Mark a child frame visible again.
     ShowChildFrame { frame_id: u64 },

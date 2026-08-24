@@ -5870,6 +5870,34 @@ fn delete_frame_destroys_top_level_gui_window_from_display_host() {
 }
 
 #[test]
+fn deleting_final_gui_frame_restores_selected_terminal_frame() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    let scratch = ev.buffers.create_buffer("*scratch*");
+    ev.buffers.set_current(scratch);
+    let terminal_id = ev.frames.create_frame("terminal", 80, 25, scratch);
+    let gui_id = ev.frames.create_frame("gui", 960, 640, scratch);
+    ev.frames
+        .get_mut(gui_id)
+        .expect("GUI frame")
+        .set_window_system(Some(Value::symbol("neo")));
+    assert!(ev.frames.select_frame(gui_id));
+
+    super::delete_frame_owned(&mut ev, gui_id, super::DeleteFrameMode::Noelisp)
+        .expect("delete final GUI frame");
+
+    assert_eq!(
+        ev.frames.selected_frame().map(|frame| frame.id),
+        Some(terminal_id)
+    );
+    assert!(
+        ev.frames
+            .selected_frame()
+            .is_some_and(|frame| frame.effective_window_system().is_none())
+    );
+}
+
+#[test]
 fn delete_parent_frame_cascades_to_gui_child_overlays() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();

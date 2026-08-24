@@ -26,8 +26,9 @@ runs:
       shell: bash
       run: |
         tar xzf neomacs-test-runtime-linux-x86_64.tar.gz
-        chmod +x target/release/neomacs
+        chmod +x target/release/neomacs target/release/neomacsclient
         test -x target/release/neomacs
+        test -x target/release/neomacsclient
         test -f target/release/neomacs.pdump
         test -f lisp/international/charscript.el
         test -f lisp/international/charprop.el
