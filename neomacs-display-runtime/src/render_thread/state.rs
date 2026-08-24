@@ -10,8 +10,9 @@ pub use crate::thread_comm::MonitorInfo;
 use crate::thread_comm::RenderComms;
 pub(super) use neomacs_display_protocol::PointerAppearancePhase;
 use neomacs_display_protocol::{
-    EffectsConfig, FrameGlyphBuffer, FrameRect, InteractionId, PointerAppearanceId,
-    PointerAppearanceSelection, PresentationId, ToolBarImageSource, TransitionPolicy,
+    EffectOperation, EffectValue, EffectsConfig, FrameGlyphBuffer, FrameRect, InteractionId,
+    PointerAppearanceId, PointerAppearanceSelection, PresentationId, ToolBarImageSource,
+    TransitionPolicy, VisualConfig,
 };
 use neomacs_renderer_wgpu::WgpuRenderer;
 use neovm_core::emacs_core::image_catalog::ResolvedImageMetadata;
@@ -672,6 +673,53 @@ pub(super) const fn device_recovery_target(
     }
 }
 
+pub(super) fn is_cpu_adapter(device_type: wgpu::DeviceType) -> bool {
+    device_type == wgpu::DeviceType::Cpu
+}
+
+pub(super) fn needs_offscreen_render(
+    policy: TransitionPolicy,
+    frame_has_theme_transition: bool,
+    cpu_adapter: bool,
+) -> bool {
+    !cpu_adapter && (policy.needs_offscreen() || frame_has_theme_transition)
+}
+
+pub(super) fn effective_visual_config(requested: &VisualConfig, cpu_adapter: bool) -> VisualConfig {
+    if !cpu_adapter {
+        return requested.clone();
+    }
+
+    let mut effective = requested.clone();
+    effective.cursor_motion.enabled = false;
+    effective.cursor_size_transition.enabled = false;
+    effective.crossfade_transition.enabled = false;
+    effective.scroll_transition.enabled = false;
+
+    let disable_effects = effective
+        .effects
+        .effect_names()
+        .into_iter()
+        .filter(|name| {
+            effective
+                .effects
+                .effect_values(name)
+                .is_ok_and(|properties| {
+                    properties.iter().any(|(property, _)| property == "enabled")
+                })
+        })
+        .map(|name| EffectOperation::set(name, [("enabled", EffectValue::Bool(false))]))
+        .collect::<Vec<_>>();
+    effective.effects = effective
+        .effects
+        .apply_effects(&disable_effects)
+        .expect("effect registry must be able to disable every enabled effect");
+    effective.effects.bg_pattern.style = 0;
+    effective.effects.mode_line_separator.style = 0;
+    effective.effects.scroll_bar.width = 0;
+    effective
+}
+
 pub(super) struct RenderApp {
     pub(super) comms: RenderComms,
 
@@ -684,6 +732,7 @@ pub(super) struct RenderApp {
 
     pub(super) gpu: Option<RenderGpuContext>,
     pub(super) renderer: Option<WgpuRenderer>,
+    pub(super) cpu_adapter: bool,
 
     /// Shared device-lost latch (`Arc<AtomicBool>` inside) plus the
     /// consecutive surface-Lost streak. Fed by the wgpu device-lost callback
@@ -704,6 +753,7 @@ pub(super) struct RenderApp {
 
     pub(super) cursor_defaults: CursorState,
 
+    pub(super) requested_visual_config: VisualConfig,
     pub(super) effects: EffectsConfig,
 
     pub(super) transition_policy: TransitionPolicy,
@@ -787,6 +837,23 @@ pub(super) fn media_budget_env_limit() -> Option<usize> {
 }
 
 impl RenderApp {
+    pub(super) fn apply_requested_visual_config(&mut self) {
+        let effective = effective_visual_config(&self.requested_visual_config, self.cpu_adapter);
+        self.cursor_defaults.apply_visual_config(&effective);
+        self.transition_policy = TransitionPolicy::from(&effective);
+        self.frame_windows
+            .apply_top_level_transition_policy(self.transition_policy);
+        self.effects = effective.effects.clone();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.effects = self.effects.clone();
+        }
+        self.frame_windows
+            .sync_top_level_cursor_config(&self.cursor_defaults, true);
+        if !self.cursor_defaults.blink_enabled {
+            self.frame_windows.force_top_level_cursor_blink_on();
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn new(
         comms: RenderComms,
@@ -839,12 +906,14 @@ impl RenderApp {
             clipboard: Err("clipboard is unavailable before display initialization".to_owned()),
             gpu: None,
             renderer: None,
+            cpu_adapter: false,
             device_lost: super::device_loss::DeviceLossDetector::new(),
             faces: HashMap::new(),
             faces_signature: Vec::new(),
             modifiers: 0,
             image_metadata,
             cursor_defaults: CursorState::default(),
+            requested_visual_config: VisualConfig::default(),
             effects: EffectsConfig::default(),
             transition_policy: TransitionPolicy::default(),
             #[cfg(feature = "wpe-webkit")]
