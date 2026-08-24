@@ -1525,6 +1525,20 @@ pub(crate) fn make_lisp_face_vector() -> Value {
     Value::vector(values)
 }
 
+fn reset_gui_default_lisp_face_font_slots(vector: Value) {
+    for attr in [
+        LFaceAttr::Family,
+        LFaceAttr::Foundry,
+        LFaceAttr::Width,
+        LFaceAttr::Height,
+        LFaceAttr::Weight,
+        LFaceAttr::Slant,
+        LFaceAttr::Font,
+    ] {
+        set_lisp_face_vector_attr(vector, attr, Value::symbol("unspecified"));
+    }
+}
+
 fn reset_lisp_face_vector(vector: Value) {
     let unspecified = unspecified_face_symbol();
     let _ = vector.with_vector_data_mut(|slots| {
@@ -1564,16 +1578,23 @@ fn set_lisp_face_vector_attr_with_font_derivatives(
 ) -> Result<(), Flow> {
     set_lisp_face_vector_attr(vector, attr, attr_value);
     if attr == LFaceAttr::Font && !is_reset_like_face_attr_value(&attr_value) {
-        for (derived_attr, derived_value) in
-            derived_face_attrs_from_font_value(&font_derivation_value)
-        {
-            let (canonical_attr, canonical_value) = normalize_face_attr_for_set(
-                face_name,
-                SetFaceAttr::LFace(derived_attr),
-                derived_value,
-            )?;
-            set_lisp_face_vector_attr(vector, canonical_attr, canonical_value);
-        }
+        set_lisp_face_vector_font_derivatives(face_name, vector, &font_derivation_value)?;
+    }
+    Ok(())
+}
+
+fn set_lisp_face_vector_font_derivatives(
+    face_name: &str,
+    vector: Value,
+    font_value: &Value,
+) -> Result<(), Flow> {
+    for (derived_attr, derived_value) in derived_face_attrs_from_font_value(font_value) {
+        let (canonical_attr, canonical_value) = normalize_face_attr_for_set(
+            face_name,
+            SetFaceAttr::LFace(derived_attr),
+            derived_value,
+        )?;
+        set_lisp_face_vector_attr(vector, canonical_attr, canonical_value);
     }
     Ok(())
 }
@@ -1678,11 +1699,6 @@ fn frame_parameter_color_or_tty_default(
         .unwrap_or_else(|| Value::string(tty_default))
 }
 
-fn default_face_has_explicit_font_attr(attr: LFaceAttr) -> bool {
-    get_face_override("default", attr, false).is_some()
-        || get_face_override("default", attr, true).is_some()
-}
-
 pub(crate) fn realize_default_lisp_face_for_frame(
     eval: &mut super::eval::Context,
     frame_id: FrameId,
@@ -1726,7 +1742,10 @@ pub(crate) fn realize_default_lisp_face_for_frame(
             LFaceAttr::Weight,
             LFaceAttr::Slant,
         ] {
-            if default_face_has_explicit_font_attr(attr) {
+            if get_face_override("default", attr, true).is_some()
+                || lisp_face_vector_attr(vector, attr)
+                    .is_some_and(|value| !value.is_symbol_named("unspecified"))
+            {
                 continue;
             }
             let fallback = live_frame_font_attribute_fallback(eval, frame_id, attr);
@@ -2247,6 +2266,15 @@ fn ensure_frame_lisp_face_vector_by_symbol(
         FrameFaceInitial::Empty => make_lisp_face_vector(),
         FrameFaceInitial::SelectedBase => make_lisp_face_vector_for_domain(face_name, false),
     };
+    if face_name == "default"
+        && matches!(initial, FrameFaceInitial::SelectedBase)
+        && eval
+            .frames
+            .get(frame_id)
+            .is_some_and(|frame| frame.effective_window_system().is_some())
+    {
+        reset_gui_default_lisp_face_font_slots(vector);
+    }
     let frame = eval.frames.get_mut(frame_id)?;
     crate::emacs_core::xfaces::upsert_frame_face_hash_entry(
         frame.face_hash_table(),
@@ -2254,6 +2282,15 @@ fn ensure_frame_lisp_face_vector_by_symbol(
         vector,
     );
     Some(vector)
+}
+
+pub(crate) fn reset_gui_default_lisp_face_font_slots_in_frame(frame: &mut crate::window::Frame) {
+    if frame.effective_window_system().is_some()
+        && let Some(vector) =
+            lookup_frame_face_hash_entry(frame.face_hash_table(), Value::symbol("default"))
+    {
+        reset_gui_default_lisp_face_font_slots(vector);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3187,17 +3224,46 @@ pub(crate) fn builtin_internal_set_lisp_face_attribute(
             if matches!(canonical_attr, LFaceAttr::Font | LFaceAttr::Fontset)
                 && let Some(frame_ids) = live_frame_ids.as_mut()
             {
-                frame_ids.retain(|frame_id| {
-                    eval.frames.get(*frame_id).is_some_and(|frame| {
-                        FrameFontRealization::for_frame(frame).stores_face_font_attributes()
+                let supported_frame_ids = frame_ids
+                    .iter()
+                    .copied()
+                    .filter(|frame_id| {
+                        eval.frames.get(*frame_id).is_some_and(|frame| {
+                            FrameFontRealization::for_frame(frame).stores_face_font_attributes()
+                        })
                     })
-                });
-                if frame_ids.is_empty() {
-                    // GNU's QCfont/QCfontset arms are guarded by
-                    // FRAME_WINDOW_P.  A live terminal accepts the call but
-                    // leaves its Lisp face vector untouched.
+                    .collect::<Vec<_>>();
+                if supported_frame_ids.is_empty() {
+                    // GNU TTY faces do not store the font itself, but the
+                    // derived Lisp face attributes remain authoritative.
+                    if canonical_attr == LFaceAttr::Font
+                        && !is_reset_like_face_attr_value(&canonical_value)
+                    {
+                        apply_derived_font_face_overrides(&face_name, &canonical_value, false)?;
+                        let initial = if is_known_lisp_face_name(&face_name) {
+                            FrameFaceInitial::SelectedBase
+                        } else {
+                            FrameFaceInitial::Empty
+                        };
+                        for frame_id in frame_ids.iter().copied() {
+                            if let Some(vector) = ensure_frame_lisp_face_vector_by_symbol(
+                                eval,
+                                frame_id,
+                                face_symbol,
+                                &face_name,
+                                initial,
+                            ) {
+                                set_lisp_face_vector_font_derivatives(
+                                    &face_name,
+                                    vector,
+                                    &canonical_value,
+                                )?;
+                            }
+                        }
+                    }
                     return Ok(());
                 }
+                *frame_ids = supported_frame_ids;
             }
 
             set_face_override_id(face_id, canonical_attr, canonical_value, defaults_frame);
@@ -3613,7 +3679,6 @@ pub(crate) fn builtin_internal_get_lisp_face_attribute(
     };
 
     if face_name == "default"
-        && get_face_override(&face_name, attr_name, false).is_none()
         && matches!(
             attr_name,
             LFaceAttr::Font
@@ -3625,6 +3690,9 @@ pub(crate) fn builtin_internal_get_lisp_face_attribute(
                 | LFaceAttr::Height
         )
         && let Some(frame_id) = frame_id
+        && lookup_frame_lisp_face_vector(eval, frame_id, "default")
+            .and_then(|vector| lisp_face_vector_attr(vector, attr_name))
+            .is_none_or(|value| value.is_symbol_named("unspecified"))
         && let Some(fallback) = live_frame_font_attribute_fallback(eval, frame_id, attr_name)
     {
         return Ok(fallback);

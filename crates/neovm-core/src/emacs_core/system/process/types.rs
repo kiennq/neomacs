@@ -891,6 +891,10 @@ pub struct ProcessManager {
     pub(super) processes: HashMap<ProcessId, Process>,
     pub(super) deleted_processes: HashMap<ProcessId, Process>,
     pub(super) next_id: ProcessId,
+    /// Status notifications discovered at the wait boundary.  The wait loop
+    /// records them before servicing timers, so defer their callbacks until
+    /// the shared process-dispatch pass that follows the timer pass.
+    pub(super) deferred_status_notifications: Vec<ProcessId>,
     /// GNU's file-scope `process_tick` (src/process.c:232-233), *"Number of
     /// events of change of status of a process"*.  GNU's `update_tick`
     /// counterpart (:234-235) has no field here on purpose: it is only ever
@@ -4229,7 +4233,6 @@ pub(super) enum PendingNetworkConnect {
         socket_options: Vec<NetworkSocketOptionSpec>,
     },
     Dns(PendingDnsRequest),
-    #[cfg(unix)]
     Local,
 }
 
@@ -4418,9 +4421,17 @@ pub(super) fn apply_network_socket_option_to_socket(
 
 #[cfg(not(unix))]
 pub(super) fn apply_network_socket_option_to_socket(
-    _socket: &Socket,
+    socket: &Socket,
     spec: NetworkSocketOptionSpec,
 ) -> EvalResult {
+    if spec.option == NetworkSocketOption::Reuseaddr {
+        let value = spec.value;
+        return socket
+            .set_reuse_address(value.is_truthy())
+            .map(|_| Value::T)
+            .map_err(|err| signal_network_option_io_error(spec.keyword, value, err));
+    }
+
     Err(signal(
         "error",
         vec![Value::string(format!(
@@ -4463,11 +4474,9 @@ pub(super) fn apply_network_socket_option_to_process(
             NetworkSocket::SeqpacketListener(socket) => {
                 apply_network_socket_option_to_socket(&SockRef::from(socket), spec)
             }
-            #[cfg(unix)]
             NetworkSocket::UnixStream(stream) => {
                 apply_network_socket_option_to_socket(&SockRef::from(stream), spec)
             }
-            #[cfg(unix)]
             NetworkSocket::UnixListener(listener) => {
                 apply_network_socket_option_to_socket(&SockRef::from(listener), spec)
             }
@@ -4498,6 +4507,12 @@ pub(super) fn tcp_socket_domain(addr: SocketAddr) -> Domain {
 
 pub(super) fn network_socket_io_error(message: &str, err: std::io::Error) -> Flow {
     network_socket_io_error_with_name(message, Value::NIL, err)
+}
+
+pub(super) fn network_socket_prepare_error(path: &Path, err: std::io::Error) -> Flow {
+    let path = path.to_string_lossy().into_owned();
+    let message = format!("Cannot prepare server socket directory `{path}`");
+    signal_process_io(&message, Some(&path), err)
 }
 
 /// Translate a socket errno through the same boundary as GNU
@@ -4884,16 +4899,17 @@ pub(super) fn tcp_server_socket_options(
     effective
 }
 
-#[cfg(unix)]
 pub(super) fn bind_unix_listener_socket(
     path: &Path,
     backlog: i32,
     options: &[NetworkSocketOptionSpec],
-) -> Result<UnixListener, Flow> {
+) -> Result<Socket, Flow> {
+    local_socket::prepare_server_path(path)
+        .map_err(|err| network_socket_prepare_error(path, err))?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
         .map_err(|err| network_socket_io_error("Cannot create server socket", err))?;
     apply_network_socket_options(&socket, options)?;
-    let sock_addr = SockAddr::unix(path)
+    let sock_addr = local_socket::sockaddr_for_path(path)
         .map_err(|err| network_socket_io_error("Cannot bind server socket", err))?;
     socket
         .bind(&sock_addr)
@@ -4907,15 +4923,14 @@ pub(super) fn bind_unix_listener_socket(
     Ok(socket.into())
 }
 
-#[cfg(unix)]
 pub(super) fn connect_unix_stream_socket(
     path: &Path,
     options: &[NetworkSocketOptionSpec],
-) -> Result<UnixStream, Flow> {
+) -> Result<Socket, Flow> {
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
         .map_err(|err| network_socket_io_error("Cannot create client socket", err))?;
     apply_network_socket_options(&socket, options)?;
-    let sock_addr = SockAddr::unix(path)
+    let sock_addr = local_socket::sockaddr_for_path(path)
         .map_err(|err| network_socket_io_error("make client process failed", err))?;
     socket
         .connect(&sock_addr)
@@ -4926,18 +4941,17 @@ pub(super) fn connect_unix_stream_socket(
     Ok(socket.into())
 }
 
-#[cfg(unix)]
 pub(super) fn start_nonblocking_unix_stream_socket(
     path: &Path,
     options: &[NetworkSocketOptionSpec],
-) -> Result<Result<UnixStream, std::io::Error>, Flow> {
+) -> Result<Result<Socket, std::io::Error>, Flow> {
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
         .map_err(|err| network_socket_io_error("Cannot create client socket", err))?;
     apply_network_socket_options(&socket, options)?;
     socket
         .set_nonblocking(true)
         .map_err(|err| network_socket_io_error("set_nonblocking", err))?;
-    let sock_addr = SockAddr::unix(path)
+    let sock_addr = local_socket::sockaddr_for_path(path)
         .map_err(|err| network_socket_io_error("make client process failed", err))?;
     match socket.connect(&sock_addr) {
         Ok(()) => Ok(Ok(socket.into())),
@@ -5352,6 +5366,7 @@ impl ProcessManager {
             processes: HashMap::new(),
             deleted_processes: HashMap::new(),
             next_id: 1,
+            deferred_status_notifications: Vec::new(),
             process_tick: 0,
             default_read_config: ProcessReadConfig::default(),
             env_overrides: HashMap::new(),
@@ -7446,11 +7461,10 @@ impl ProcessManager {
                 remote_addr: SockAddr,
                 local_addr: Option<SockAddr>,
             },
-            #[cfg(unix)]
             Unix {
-                stream: UnixStream,
-                remote_name: String,
-                local_name: String,
+                stream: Socket,
+                remote_addr: SockAddr,
+                local_addr: Option<SockAddr>,
             },
         }
 
@@ -7481,15 +7495,10 @@ impl ProcessManager {
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
                         Err(_) => Ok(None),
                     },
-                    #[cfg(unix)]
                     Some(NetworkSocket::UnixListener(listener)) => match listener.accept() {
-                        Ok((stream, _)) => Ok(Some(AcceptedSocket::Unix {
-                            remote_name: unix_socket_addr_to_runtime_string(
-                                stream.peer_addr().ok(),
-                            ),
-                            local_name: unix_socket_addr_to_runtime_string(
-                                stream.local_addr().ok(),
-                            ),
+                        Ok((stream, remote_addr)) => Ok(Some(AcceptedSocket::Unix {
+                            local_addr: listener.local_addr().ok(),
+                            remote_addr,
                             stream,
                         })),
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -7672,13 +7681,36 @@ impl ProcessManager {
                         )
                     }
                 }
-                #[cfg(unix)]
                 AcceptedSocket::Unix {
                     stream,
-                    remote_name,
-                    local_name,
+                    remote_addr,
+                    local_addr,
                 } => {
                     let _ = stream.set_nonblocking(true);
+                    let remote_name = socket2_unix_sockaddr_to_runtime_string(Some(&remote_addr));
+                    let local_name = socket2_unix_sockaddr_to_runtime_string(local_addr.as_ref());
+                    let local_name = if local_name.is_empty() {
+                        let local = process_contact_plist_get(
+                            server_contact,
+                            ProcessKeyword::Local.value(),
+                        );
+                        let local = if local.is_nil() {
+                            process_contact_plist_get(
+                                server_contact,
+                                ProcessKeyword::Service.value(),
+                            )
+                        } else {
+                            local
+                        };
+                        local
+                            .as_lisp_string()
+                            .map(|path| {
+                                crate::emacs_core::emacs_char::to_utf8_lossy(path.as_bytes())
+                            })
+                            .unwrap_or(local_name)
+                    } else {
+                        local_name
+                    };
                     contact = process_contact_plist_put(
                         contact,
                         ProcessKeyword::Host.value(),
@@ -8690,8 +8722,10 @@ impl super::super::eval::Context {
         request: &ProcessOutputServiceRequest,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let target_process = request.target_process();
-        let proc_ids = request.live_processes(self.processes.live_process_ids());
-        self.poll_process_output_for_ids(proc_ids, target_process, true)
+        let deferred = self.processes.take_deferred_status_notifications();
+        let mut proc_ids = deferred.clone();
+        proc_ids.extend(request.live_processes(self.processes.live_process_ids()));
+        self.poll_process_output_for_ids(proc_ids, target_process, true, &deferred)
     }
 
     /// GNU `status_notify (NULL, WAIT_PROC)` (src/process.c:5554, :5854), with
@@ -8718,7 +8752,7 @@ impl super::super::eval::Context {
     /// set, rather than being revisited by every later walk forever.
     pub(crate) fn notify_processes_with_unnotified_status_change(
         &mut self,
-        target_process: Option<ProcessId>,
+        _target_process: Option<ProcessId>,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let visit = self.processes.processes_with_unnotified_status_change();
         if visit.is_empty() {
@@ -8730,11 +8764,12 @@ impl super::super::eval::Context {
         for id in &visit {
             self.processes.mark_status_change_notified(*id);
         }
-        // `publish_status_before_readable_output` is GNU's order in
-        // `status_notify` itself: it drains the process's remaining output
-        // (:7896-7909) and then runs the sentinel, so the status is what the
-        // visit is FOR.
-        self.poll_process_output_for_ids(visit, target_process, true)
+        // The wait loop calls this before its timer pass.  Keep the visit set
+        // intact, but let the shared process-dispatch pass consume it after
+        // timers have run; GNU's order is timer callbacks before process
+        // filters and sentinels.
+        self.processes.defer_status_notifications(visit);
+        Ok(ProcessOutputServiceOutcome::default())
     }
 
     pub(crate) fn poll_ready_process_output_for_service_request(
@@ -8744,6 +8779,7 @@ impl super::super::eval::Context {
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let target_process = request.target_process();
         let mut outcome = ProcessOutputServiceOutcome::default();
+        let deferred = self.processes.take_deferred_status_notifications();
 
         let writable_processes = request.ready_processes(events.writable_processes_ref().to_vec());
         for pid in writable_processes {
@@ -8782,8 +8818,14 @@ impl super::super::eval::Context {
             }
         }
 
-        let proc_ids = request.ready_processes(events.ready_processes_ref().to_vec());
-        outcome.absorb(self.poll_process_output_for_ids(proc_ids, target_process, false)?);
+        let mut proc_ids = deferred.clone();
+        proc_ids.extend(request.ready_processes(events.ready_processes_ref().to_vec()));
+        outcome.absorb(self.poll_process_output_for_ids(
+            proc_ids,
+            target_process,
+            false,
+            &deferred,
+        )?);
 
         Ok(outcome)
     }
@@ -8793,6 +8835,7 @@ impl super::super::eval::Context {
         proc_ids: Vec<ProcessId>,
         target_process: Option<ProcessId>,
         publish_status_before_readable_output: bool,
+        deferred_status_notifications: &[ProcessId],
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut proc_ids = dedupe_process_ids(proc_ids);
 
@@ -8843,11 +8886,12 @@ impl super::super::eval::Context {
                 }
                 continue;
             }
-            if self
+            let is_deferred_status = deferred_status_notifications.contains(&pid);
+            let has_pending_status = self
                 .processes
                 .get(pid)
-                .is_some_and(|process| process.status_notify_pending)
-            {
+                .is_some_and(|process| process.status_notify_pending);
+            if has_pending_status || is_deferred_status {
                 // GNU's `status_notify` walks the process alist newest-first,
                 // and an implicit `:stderr` pipe is created BEFORE the process
                 // that owns it, so within one notification pass the owner's
@@ -8873,10 +8917,11 @@ impl super::super::eval::Context {
                     .processes
                     .get(pid)
                     .is_some_and(process_defers_pty_status_after_explicit_coding);
-                let defers_deferred_status_after_child_output = self
-                    .processes
-                    .get(pid)
-                    .is_some_and(process_defers_deferred_status_after_child_output);
+                let defers_deferred_status_after_child_output = is_deferred_status
+                    && self
+                        .processes
+                        .get(pid)
+                        .is_some_and(process_defers_deferred_status_after_child_output);
                 if defers_deferred_status_after_child_output {
                     // A Windows child handle can become signaled before the
                     // pipe's bytes are visible to PeekNamedPipe.  Do not
@@ -8898,7 +8943,10 @@ impl super::super::eval::Context {
                                 continue;
                             }
                         }
-                        ProcessOutputDrainDisposition::Blocked => continue,
+                        ProcessOutputDrainDisposition::Blocked => {
+                            self.processes.defer_status_notifications(vec![pid]);
+                            continue;
+                        }
                         ProcessOutputDrainDisposition::Terminal => {}
                     }
                     outcome.absorb(self.run_process_status_notification(pid, target_process)?);
@@ -8917,9 +8965,7 @@ impl super::super::eval::Context {
                         ProcessOutputDrainDisposition::Terminal => {}
                     }
                 }
-                {
-                    outcome.absorb(self.run_process_status_notification(pid, target_process)?);
-                }
+                outcome.absorb(self.run_process_status_notification(pid, target_process)?);
                 continue;
             }
             // A child status transition (exit, signal, stop, continued) is

@@ -913,6 +913,21 @@ impl ProcessManager {
         ids.sort_unstable_by(|a, b| b.cmp(a));
         ids
     }
+
+    /// Defer a status-notification visit until the wait's common process
+    /// dispatch point, which runs after the wait's timer service.
+    pub(crate) fn defer_status_notifications(&mut self, ids: Vec<ProcessId>) {
+        for id in ids {
+            if !self.deferred_status_notifications.contains(&id) {
+                self.deferred_status_notifications.push(id);
+            }
+        }
+    }
+
+    /// Take the status-notification visit deferred by the wait boundary.
+    pub(crate) fn take_deferred_status_notifications(&mut self) -> Vec<ProcessId> {
+        std::mem::take(&mut self.deferred_status_notifications)
+    }
 }
 
 // ---------------------------------------------------------------------------

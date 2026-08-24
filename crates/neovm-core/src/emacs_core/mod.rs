@@ -117,6 +117,11 @@ pub mod autoload;
 pub mod cl_lib;
 #[path = "lisp/custom/mod.rs"]
 pub mod custom;
+#[path = "system/daemon/mod.rs"]
+pub mod daemon;
+#[cfg(test)]
+#[path = "system/daemon/tests/mod.rs"]
+mod daemon_test;
 #[path = "lisp/doc/mod.rs"]
 pub mod doc;
 #[path = "lisp/hook_runtime/mod.rs"]

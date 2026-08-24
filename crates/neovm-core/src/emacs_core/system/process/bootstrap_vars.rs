@@ -615,12 +615,10 @@ pub(super) fn parse_network_service_port(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NetworkAddressSpec {
     Inet(SocketAddr),
-    #[cfg(unix)]
     Local(std::path::PathBuf),
 }
 
 pub(super) fn parse_network_address_spec(value: &Value) -> Result<NetworkAddressSpec, Flow> {
-    #[cfg(unix)]
     if matches!(value.kind(), ValueKind::String) {
         return Ok(NetworkAddressSpec::Local(
             crate::emacs_core::fileio::lisp_file_name_to_path_buf(
@@ -700,17 +698,13 @@ pub(super) fn socket_addr_to_lisp_value(addr: SocketAddr) -> Value {
     }
 }
 
-#[cfg(unix)]
-pub(super) fn unix_socket_addr_to_runtime_string(addr: Option<UnixSocketAddr>) -> String {
-    addr.and_then(|addr| {
-        addr.as_pathname()
-            .map(|path| path.as_os_str().to_string_lossy().into_owned())
-    })
-    .unwrap_or_default()
-}
-
-#[cfg(unix)]
 pub(super) fn socket2_unix_sockaddr_to_runtime_string(addr: Option<&SockAddr>) -> String {
+    #[cfg(windows)]
+    {
+        let _ = addr;
+        return String::new();
+    }
+    #[cfg(unix)]
     addr.and_then(|addr| {
         addr.as_pathname()
             .map(|path| path.as_os_str().to_string_lossy().into_owned())

@@ -2335,6 +2335,7 @@ fn deferred_stderr_notification_still_notifies_pending_owner_first() {
         stderr.status_notify_pending = true;
         stderr.live_io.stderr_pipe_owner = Some(owner_id);
     }
+    eval.processes.defer_status_notifications(vec![stderr_id]);
     let request = ProcessOutputServiceRequest::target_only(stderr_id);
     eval.poll_process_output_for_service_request(&request)
         .expect("deferred status service pass");
@@ -2376,6 +2377,7 @@ fn deferred_terminal_status_without_child_is_published_in_service_pass() {
         process.pending_status = process_status_exit_value(0);
         process.status_notify_pending = true;
     }
+    eval.processes.defer_status_notifications(vec![id]);
 
     let request = ProcessOutputServiceRequest::target_only(id);
     eval.poll_process_output_for_service_request(&request)
@@ -4793,10 +4795,10 @@ fn serial_process_configure_resolves_buffer_and_port_designators() {
                              :speed 9600)))
              (unwind-protect
                  (progn
-                      (serial-process-configure
-                       :port "/dev/ptmx"
-                       :bytesize 7
-                       :parity 'even)
+                   (serial-process-configure
+                    :port "/dev/ptmx"
+                    :bytesize 7
+                    :parity 'even)
                    (serial-process-configure
                     :buffer "neo-serial-by-buffer"
                     :parity 'even)
@@ -8114,20 +8116,71 @@ fn make_network_process_feature_advertisement_is_conservative() {
         any(target_os = "linux", target_os = "android") => {
             "OK (t t t t t t t t t t t t t t t t t t)"
         }
-        _ => {
+        unix => {
             "OK (t t t t t t t t t t t nil t nil t t t t)"
+        }
+        _ => {
+            if crate::local_socket::stream_supported() {
+                "OK (t t t t t t t t t t t nil t nil t t t t)"
+            } else {
+                "OK (t nil t t t t t t t t t nil t nil t t t t)"
+            }
         }
     };
     let expected_subfeatures = cfg_select! {
         any(target_os = "linux", target_os = "android") => {
             "OK (:nodelay :reuseaddr :priority :oobinline :linger :keepalive :dontroute :broadcast :bindtodevice (:server t) (:service t) (:family ipv6) (:family ipv4) (:family local) (:type seqpacket) (:type datagram) (:nowait t))"
         }
-        _ => {
+        unix => {
             "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:server t) (:service t) (:family ipv6) (:family ipv4) (:family local) (:type seqpacket) (:type datagram) (:nowait t))"
+        }
+        _ => {
+            if crate::local_socket::stream_supported() {
+                "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:server t) (:service t) (:family ipv6) (:family ipv4) (:family local) (:type seqpacket) (:type datagram) (:nowait t))"
+            } else {
+                "OK (:nodelay :reuseaddr :oobinline :linger :keepalive :dontroute :broadcast (:server t) (:service t) (:family ipv6) (:family ipv4) (:type seqpacket) (:type datagram) (:nowait t))"
+            }
         }
     };
     assert_eq!(results[0], expected_featurep);
     assert_eq!(results[1], expected_subfeatures);
+}
+
+fn features_contain_local_family(features: Value) -> bool {
+    crate::emacs_core::value::list_to_vec(&features)
+        .expect("make-network-process subfeatures should be a proper list")
+        .into_iter()
+        .any(|feature| {
+            crate::emacs_core::value::list_to_vec(&feature)
+                .is_some_and(|parts| parts == [Value::symbol(":family"), Value::symbol("local")])
+        })
+}
+
+#[test]
+fn make_network_process_local_family_matches_platform() {
+    let features = make_network_process_subfeatures();
+    assert_eq!(
+        features_contain_local_family(features),
+        cfg!(unix) || crate::local_socket::stream_supported(),
+        "local sockets must not be advertised where make-network-process rejects them"
+    );
+}
+
+#[test]
+fn make_network_process_constructor_applies_reuseaddr_on_all_platforms() {
+    crate::test_utils::init_test_tracing();
+    let results = eval_all(
+        r#"(let ((p (make-network-process
+                    :name "netopt-reuseaddr" :server t :service 0
+                    :reuseaddr t)))
+             (unwind-protect
+                 (list
+                  (process-status p)
+                  (process-contact p :reuseaddr))
+               (ignore-errors (delete-process p))))"#,
+    );
+
+    assert_eq!(results[0], "OK (listen t)");
 }
 
 #[test]
@@ -8473,9 +8526,12 @@ fn process_send_string_waits_for_nowait_tcp_connect_like_gnu() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn process_send_string_waits_for_nowait_local_stream_connect_like_gnu() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((events nil) (recv nil) (srv nil) (cli nil)
@@ -9051,6 +9107,49 @@ fn make_network_process_stream_server_accepts_client_like_gnu() {
 }
 
 #[test]
+fn make_network_process_server_plist_isolated_between_accepted_clients() {
+    crate::test_utils::init_test_tracing();
+    let results = eval_all(
+        r#"(let ((events nil)
+                 (srv nil)
+                 (cli1 nil)
+                 (cli2 nil))
+             (unwind-protect
+                 (progn
+                   (setq srv (make-network-process
+                              :name "plist-srv" :server t :service t :host 'local
+                              :plist '(:authenticated nil :foo bar)
+                              :log (lambda (server client _msg)
+                                     (when (null events)
+                                       (process-put client :authenticated t))
+                                     (push (list (process-get server :authenticated)
+                                                 (process-get client :authenticated)
+                                                 (process-get client :foo))
+                                           events))))
+                   (setq cli1 (make-network-process
+                               :name "plist-cli1" :host 'local
+                               :service (process-contact srv :service)))
+                   (dotimes (_ 20)
+                     (when (< (length events) 1)
+                       (accept-process-output nil 0.05)))
+                   (setq cli2 (make-network-process
+                               :name "plist-cli2" :host 'local
+                               :service (process-contact srv :service)))
+                   (dotimes (_ 20)
+                     (when (< (length events) 2)
+                       (accept-process-output nil 0.05)))
+                   (list (process-get srv :authenticated)
+                         (process-get srv :foo)
+                         (nreverse events)))
+               (when cli2 (delete-process cli2))
+               (when cli1 (delete-process cli1))
+               (when srv (delete-process srv))))"#,
+    );
+
+    assert_eq!(results[0], "OK (nil bar ((nil t bar) (nil nil bar)))");
+}
+
+#[test]
 fn make_network_process_explicit_inet_address_skips_host_service_family_like_gnu() {
     crate::test_utils::init_test_tracing();
     let results = eval_all(
@@ -9090,9 +9189,87 @@ fn make_network_process_explicit_inet_address_skips_host_service_family_like_gnu
     assert_eq!(results[0], "OK (listen t t t 42 bogus open t t 42 nil)");
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+#[test]
+fn local_server_stream_bind_prepares_selected_socket_directory() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
+
+    use tempfile::tempdir;
+
+    let _guard = crate::local_socket::TEST_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let root = tempdir().unwrap();
+    let selected = root.path().join("selected");
+    let endpoint = selected.join("server");
+    let old_override = std::env::var_os("NEOMACS_SERVER_SOCKET_DIR");
+    unsafe {
+        std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", &selected);
+    }
+
+    let listener = bind_unix_listener_socket(&endpoint, 1, &[]).expect("bind local server");
+    assert!(selected.is_dir());
+    drop(listener);
+
+    match old_override {
+        Some(value) => unsafe { std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", value) },
+        None => unsafe { std::env::remove_var("NEOMACS_SERVER_SOCKET_DIR") },
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn local_server_stream_bind_reports_socket_path_and_policy_detail() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
+
+    use tempfile::tempdir;
+
+    let _guard = crate::local_socket::TEST_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let root = tempdir().unwrap();
+    let selected = root.path().join("existing");
+    let endpoint = selected.join("server");
+    std::fs::create_dir_all(&selected).unwrap();
+    let old_override = std::env::var_os("NEOMACS_SERVER_SOCKET_DIR");
+    unsafe {
+        std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", &selected);
+    }
+
+    let endpoint_lisp = endpoint
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let detail = eval_one(&format!(
+        r#"(condition-case err
+               (make-network-process
+                :name "socket-policy-error"
+                :server t
+                :family 'local
+                :service "{endpoint_lisp}")
+             (error err))"#
+    ));
+    assert!(detail.contains(&endpoint_lisp), "{detail}");
+    assert!(detail.contains("DACL"), "{detail}");
+
+    match old_override {
+        Some(value) => unsafe { std::env::set_var("NEOMACS_SERVER_SOCKET_DIR", value) },
+        None => unsafe { std::env::remove_var("NEOMACS_SERVER_SOCKET_DIR") },
+    }
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn make_network_process_local_stream_server_accepts_client_like_gnu() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((path (make-temp-file "neomacs-local-sock-"))
@@ -9137,9 +9314,12 @@ fn make_network_process_local_stream_server_accepts_client_like_gnu() {
     assert_eq!(results[0], "OK (listen t t t open t t 1 t t t t t)");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn make_network_process_server_plist_is_inherited_by_accepted_local_client() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((path (make-temp-file "neomacs-local-plist-"))
@@ -9172,7 +9352,7 @@ fn make_network_process_server_plist_is_inherited_by_accepted_local_client() {
     assert_eq!(results[0], "OK (t bar 1 (t t bar))");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn accepted_local_client_shallow_copies_server_plist_like_gnu() {
     crate::test_utils::init_test_tracing();
@@ -9351,6 +9531,9 @@ fn accepted_local_client_completes_the_pinentry_initial_handshake() {
 #[cfg(unix)]
 #[test]
 fn make_network_process_explicit_local_address_skips_family_like_gnu() {
+    if !crate::local_socket::stream_supported() {
+        return;
+    }
     crate::test_utils::init_test_tracing();
     let results = eval_all(
         r#"(let ((path (make-temp-file "neomacs-local-address-"))
@@ -14606,10 +14789,10 @@ fn process_send_eof_rejects_a_finished_process_like_gnu() {
 /// 180's measured regression and which broke `treemacs-magit`.  See
 /// `a_sentinel_runs_inside_the_wait_while_the_callers_let_is_live_like_gnu`.
 ///
-/// The test spins over `maybe_quit` and requires that NOTHING moved, then
-/// enters one wait and requires GNU's answer.  Both halves are needed: the
-/// first is the type-level guarantee observed at run time (`maybe_quit` cannot
-/// even spell the call, because
+/// The test probes `maybe_quit` repeatedly and requires that NOTHING moved,
+/// then enters one wait and requires GNU's answer.  Both halves are needed:
+/// the first is the type-level guarantee observed at run time (`maybe_quit`
+/// cannot even spell the call, because
 /// [`WaitStatusNotifySite`](crate::emacs_core::wait::WaitStatusNotifySite)'s
 /// constructors are private to `wait.rs`), and the second is the ENGAGEMENT
 /// check ledger P5.2 demands -- a trigger that never fires would pass the
@@ -14617,8 +14800,8 @@ fn process_send_eof_rejects_a_finished_process_like_gnu() {
 ///
 /// **The control is asked of the KERNEL and not of this port** (ledger 187's
 /// rule): the child must be a `/proc` ZOMBIE -- exited and unreaped -- before
-/// the spin begins, so a run in which the child had not actually exited fails
-/// on the control rather than agreeing with itself.
+/// the probe sequence begins, so a run in which the child had not actually
+/// exited fails on the control rather than agreeing with itself.
 #[cfg(unix)]
 #[test]
 fn the_child_status_record_is_the_waits_work_and_maybe_quit_never_does_it() {
@@ -14663,28 +14846,27 @@ fn the_child_status_record_is_the_waits_work_and_maybe_quit_never_does_it() {
     }
     assert!(
         is_zombie(os_pid),
-        "control: the child must be exited and unreaped before the spin"
+        "control: the child must be exited and unreaped before the probe sequence"
     );
 
-    // HALF ONE: the spin.  Nothing here waits, and `maybe_quit` is reached
-    // over and over -- which is exactly where ledger 193 put the drain.
-    let spin_deadline = std::time::Instant::now() + Duration::from_millis(300);
+    // HALF ONE: deterministic progress through `maybe_quit`.  Nothing here
+    // waits, and these safe points are exactly where ledger 193 put the drain.
+    const SAFE_POINT_PROBES: u64 = 100;
     let mut safe_points: u64 = 0;
-    while std::time::Instant::now() < spin_deadline {
+    for _ in 0..SAFE_POINT_PROBES {
         eval.maybe_quit().expect("maybe_quit must not unwind here");
         safe_points += 1;
-        std::thread::yield_now();
     }
     assert!(
-        safe_points > 1000,
-        "the spin must actually reach the safe point many times, or it \
-         asserts nothing; reached it {safe_points} times"
+        safe_points == SAFE_POINT_PROBES,
+        "the deterministic safe-point probe must complete; reached it \
+         {safe_points} times"
     );
 
-    let after_spin =
+    let after_probes =
         process_effective_status(eval.processes.get(child).expect("child is still listed"));
     assert_eq!(
-        ProcessStatusSymbol::from_status_value(after_spin),
+        ProcessStatusSymbol::from_status_value(after_probes),
         Some(ProcessStatusSymbol::Run),
         "`process_pending_signals' notifies nothing (src/keyboard.c:8367-8372, \
          grep -c status_notify = 0), so no safe point outside the wait may \
