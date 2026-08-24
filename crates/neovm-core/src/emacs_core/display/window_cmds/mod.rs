@@ -6191,12 +6191,19 @@ pub(crate) fn x_create_frame_impl(
     let inherited_font_state = if explicit_font {
         None
     } else {
+        let resolved_font = |frame: &crate::window::Frame| {
+            let public_font = frame.known_parameter(FrameParam::Font)?;
+            let font_parameter = frame.parameter("font-parameter")?;
+            super::font::is_font(&font_parameter).then_some((public_font, font_parameter))
+        };
         parent_id
-            .and_then(|parent_id| frames.get(parent_id))
-            .and_then(|parent| {
-                let public_font = parent.known_parameter(FrameParam::Font)?;
-                let font_parameter = parent.parameter("font-parameter")?;
-                Some((public_font, font_parameter))
+            .and_then(|parent_id| frames.get(parent_id).and_then(resolved_font))
+            .or_else(|| frames.selected_frame().and_then(resolved_font))
+            .or_else(|| {
+                frames
+                    .frame_list()
+                    .into_iter()
+                    .find_map(|frame_id| frames.get(frame_id).and_then(resolved_font))
             })
     };
     let inherited_display_identity = parent_id
@@ -6323,6 +6330,7 @@ pub(crate) fn x_create_frame_impl(
         frame.set_window_system(Some(Value::symbol(
             crate::emacs_core::display::gui_window_system_symbol(),
         )));
+        super::xfaces::reset_gui_default_lisp_face_font_slots_in_frame(frame);
         frame.set_display_identity(inherited_display_identity);
         // NO `display-type' and NO `background-mode' here either.  GNU's
         // `x-create-frame' (src/xfns.c:4916) does not set them; its Lisp
@@ -6548,6 +6556,28 @@ pub(crate) fn delete_frame_owned(
     }
     if !eval.frames.delete_frame(fid) {
         return Err(signal("error", vec![Value::string("Cannot delete frame")]));
+    }
+    if was_top_level_gui_frame
+        && !eval.frames.frame_list().into_iter().any(|frame_id| {
+            eval.frames
+                .get(frame_id)
+                .is_some_and(|frame| frame.effective_window_system().is_some())
+        })
+        && let Some(terminal_frame_id) = eval.frames.frame_list().into_iter().find(|frame_id| {
+            eval.frames.get(*frame_id).is_some_and(|frame| {
+                frame.terminal_id == terminal_id && frame_is_top_level_non_window(frame)
+            })
+        })
+    {
+        eval.frames.select_frame(terminal_frame_id);
+        if let Some(selected_wid) = eval
+            .frames
+            .get(terminal_frame_id)
+            .map(|f| f.selected_window)
+        {
+            let _ = eval.frames.note_window_selected(selected_wid);
+        }
+        sync_selected_window_buffer_in_state(&eval.frames, &mut eval.buffers, terminal_frame_id);
     }
     if let Some(host) = eval.display_host.as_mut() {
         if was_gui_child_frame {

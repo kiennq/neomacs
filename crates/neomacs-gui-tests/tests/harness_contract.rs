@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::time::Duration;
 

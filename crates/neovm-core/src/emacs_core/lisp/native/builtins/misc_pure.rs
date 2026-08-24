@@ -514,17 +514,56 @@ pub(crate) fn builtin_current_message(
 
 pub(crate) fn builtin_daemonp(args: Vec<Value>) -> EvalResult {
     expect_args("daemonp", &args, 0)?;
-    Ok(Value::NIL)
+    Ok(super::super::daemon::daemon_value())
 }
 
-pub(crate) fn builtin_daemon_initialized(args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_daemon_initialized(
+    ctx: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
     expect_args("daemon-initialized", &args, 0)?;
-    Err(signal(
-        "error",
-        vec![Value::string(
-            "This function can only be called if emacs is run as a daemon",
-        )],
-    ))
+    if !super::super::daemon::is_daemon() {
+        return Err(signal(
+            "error",
+            vec![Value::string(
+                "This function can only be called if emacs is run as a daemon",
+            )],
+        ));
+    }
+    if super::super::daemon::is_initialized() {
+        return Err(signal(
+            "error",
+            vec![Value::string("The daemon has already been initialized")],
+        ));
+    }
+    if ctx
+        .visible_variable_value_or_nil("after-init-time")
+        .is_nil()
+    {
+        return Err(signal(
+            "error",
+            vec![Value::string(
+                "This function can only be called after loading the init files",
+            )],
+        ));
+    }
+    match super::super::daemon::mark_initialized() {
+        Ok(()) => Ok(Value::NIL),
+        Err(super::super::daemon::DaemonStateError::AlreadyInitialized) => Err(signal(
+            "error",
+            vec![Value::string("The daemon has already been initialized")],
+        )),
+        Err(super::super::daemon::DaemonStateError::NotDaemon) => Err(signal(
+            "error",
+            vec![Value::string(
+                "This function can only be called if emacs is run as a daemon",
+            )],
+        )),
+        Err(super::super::daemon::DaemonStateError::ReadinessSignalFailed) => Err(signal(
+            "error",
+            vec![Value::string("Failed to signal daemon readiness")],
+        )),
+    }
 }
 
 pub(crate) fn builtin_documentation_stringp(args: Vec<Value>) -> EvalResult {

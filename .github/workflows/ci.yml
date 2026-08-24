@@ -311,12 +311,14 @@ jobs:
       - name: Package shared test runtime
         run: |
           test -x target/release/neomacs
+          test -x target/release/neomacsclient
           test -f target/release/neomacs.pdump
           test -f lisp/international/charscript.el
           test -f lisp/international/charprop.el
           test -d etc/charsets
           tar czf neomacs-test-runtime-linux-x86_64.tar.gz \
             target/release/neomacs \
+            target/release/neomacsclient \
             target/release/neomacs.pdump \
             lisp \
             etc
@@ -621,6 +623,7 @@ jobs:
       TMPDIR: ${{ github.workspace }}/tmp
       NEOMACS_GUI_TEST_BACKEND: x11
       NEOMACS_GUI_TEST_BINARY: ${{ github.workspace }}/target/release/neomacs
+      NEOMACS_GUI_TEST_CLIENT_BINARY: ${{ github.workspace }}/target/release/neomacsclient
       NEOMACS_GUI_TEST_GNU_EMACS: /usr/bin/emacs
     steps:
       - *checkout

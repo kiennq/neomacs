@@ -2245,7 +2245,8 @@ the X resource \"reverseVideo\" is present, handle that."
           ;; property, which is used by dynamic-setting.el to respect
           ;; fonts specified by the user via frame parameters (as
           ;; opposed to face attributes).  Set the parameter manually.
-          (set-frame-parameter frame 'font-parameter delayed-font)
+          (when delayed-font
+            (set-frame-parameter frame 'font-parameter delayed-font))
           ;; Mark frame as 'was-invisible' when it was created as
           ;; invisible or iconified and PARAMETERS contains either a
           ;; width or height specification.  This should be sufficient
