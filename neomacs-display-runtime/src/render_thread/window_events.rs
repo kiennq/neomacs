@@ -140,13 +140,17 @@ impl RenderApp {
                 tracing::info!("Window close requested");
                 let is_primary = self.frame_windows.is_primary_winit(window_id);
                 let emacs_fid = self.emacs_frame_for_window_event(window_id);
-                self.comms.send_input(InputEvent::WindowClose {
-                    emacs_frame_id: emacs_fid,
-                });
-                if is_primary {
+                if is_primary && self.lifecycle_flags.daemon_mode {
+                    self.handle_daemon_primary_destroyed(emacs_fid);
+                } else {
+                    self.comms.send_input(InputEvent::WindowClose {
+                        emacs_frame_id: emacs_fid,
+                    });
+                }
+                if is_primary && !self.lifecycle_flags.daemon_mode {
                     self.lifecycle_flags.shutdown_requested = true;
                     event_loop.exit();
-                } else {
+                } else if !is_primary {
                     self.frame_windows.request_destroy(emacs_fid);
                 }
             }
@@ -161,8 +165,12 @@ impl RenderApp {
                     is_primary
                 );
                 if is_primary {
-                    self.lifecycle_flags.shutdown_requested = true;
-                    event_loop.exit();
+                    if self.lifecycle_flags.daemon_mode {
+                        self.handle_daemon_primary_destroyed(emacs_fid);
+                    } else {
+                        self.lifecycle_flags.shutdown_requested = true;
+                        event_loop.exit();
+                    }
                 } else {
                     self.frame_windows.request_destroy(emacs_fid);
                 }

@@ -4876,12 +4876,7 @@ pub(crate) fn init_builtins(ctx: &mut super::eval::Context) {
         Some(1),
     );
     ctx.defsubr("daemonp", |_ctx, args| builtin_daemonp(args), 0, Some(0));
-    ctx.defsubr(
-        "daemon-initialized",
-        |_ctx, args| builtin_daemon_initialized(args),
-        0,
-        Some(0),
-    );
+    ctx.defsubr("daemon-initialized", builtin_daemon_initialized, 0, Some(0));
     ctx.defsubr(
         "flush-standard-output",
         |_ctx, args| builtin_flush_standard_output(args),
