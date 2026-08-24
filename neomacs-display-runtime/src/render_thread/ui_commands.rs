@@ -233,19 +233,8 @@ impl RenderApp {
                 tracing::info!("Ligatures enabled: {}", enabled);
             }
             ConfigCommand::SetVisualConfig(config) => {
-                self.cursor_defaults.apply_visual_config(&config);
-                self.transition_policy = neomacs_display_protocol::TransitionPolicy::from(&config);
-                self.frame_windows
-                    .apply_top_level_transition_policy(self.transition_policy);
-                self.effects = config.effects;
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.effects = self.effects.clone();
-                }
-                self.frame_windows
-                    .sync_top_level_cursor_config(&self.cursor_defaults, true);
-                if !self.cursor_defaults.blink_enabled {
-                    self.frame_windows.force_top_level_cursor_blink_on();
-                }
+                self.requested_visual_config = config;
+                self.apply_requested_visual_config();
                 self.frame_windows.mark_top_level_dirty();
             }
             ConfigCommand::SetScrollIndicators { enabled } => {
