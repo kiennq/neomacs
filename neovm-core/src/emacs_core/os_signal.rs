@@ -134,7 +134,9 @@
 //! shape this port already uses for the Lisp profiler's watchdog flag.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// One of the OS signals this port installs a disposition for.
 ///
@@ -146,12 +148,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 /// SIGWINCH, SIGINT, SIGHUP and SIGPIPE are all still in the hole ledger
 /// 180 §9.6 opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(usize)]
+#[cfg_attr(unix, repr(usize))]
 pub(crate) enum HandledSignal {
     /// `add_user_signal (SIGUSR1, "sigusr1")`.
+    #[cfg(unix)]
     Sigusr1 = 0,
     /// `add_user_signal (SIGUSR2, "sigusr2")`.  This is `debug-on-event`'s
     /// default value (src/keyboard.c:14358-14367).
+    #[cfg(unix)]
     Sigusr2,
     /// `catch_child_signal` (src/process.c:8645-8660), which installs
     /// `deliver_child_signal` -> `handle_child_signal`.
@@ -163,27 +167,38 @@ pub(crate) enum HandledSignal {
     /// entire body is one `emacs_write` to a self-pipe (:7616-7650).  The walk
     /// that decides `changed` is what cannot go in a handler here, so it runs
     /// at the safe point instead (ledger 193).
+    #[cfg(unix)]
     Sigchld,
 }
 
 impl HandledSignal {
     /// Derived from the last discriminant, so a variant missing from
     /// [`Self::ALL`] is a compile error rather than a silent omission.
+    #[cfg(unix)]
     pub(crate) const COUNT: usize = Self::Sigchld as usize + 1;
+    #[cfg(not(unix))]
+    pub(crate) const COUNT: usize = 0;
 
+    #[cfg(unix)]
     pub(crate) const ALL: [Self; Self::COUNT] = [Self::Sigusr1, Self::Sigusr2, Self::Sigchld];
+    #[cfg(not(unix))]
+    pub(crate) const ALL: [Self; Self::COUNT] = [];
 
     /// The OS signal number.
     pub(crate) const fn number(self) -> libc::c_int {
+        #[cfg(unix)]
         match self {
             Self::Sigusr1 => libc::SIGUSR1,
             Self::Sigusr2 => libc::SIGUSR2,
             Self::Sigchld => libc::SIGCHLD,
         }
+        #[cfg(not(unix))]
+        match self {}
     }
 
     /// `file:line` of the install in the GNU tree.
     pub(crate) const fn gnu(self) -> &'static str {
+        #[cfg(unix)]
         match self {
             Self::Sigusr1 => "src/sysdep.c, init_signals: add_user_signal (SIGUSR1, \"sigusr1\")",
             Self::Sigusr2 => "src/sysdep.c, init_signals: add_user_signal (SIGUSR2, \"sigusr2\")",
@@ -191,10 +206,13 @@ impl HandledSignal {
                 "src/process.c:8650, catch_child_signal: sigaction (SIGCHLD, &action, &old_action)"
             }
         }
+        #[cfg(not(unix))]
+        match self {}
     }
 
     /// What the Lisp thread does with a delivery -- **data only**.
     pub(crate) const fn disposition(self) -> InstalledDisposition {
+        #[cfg(unix)]
         match self {
             Self::Sigusr1 => InstalledDisposition::UserSignal {
                 lisp_name: "sigusr1",
@@ -204,12 +222,15 @@ impl HandledSignal {
             },
             Self::Sigchld => InstalledDisposition::ChildStatus,
         }
+        #[cfg(not(unix))]
+        match self {}
     }
 
     /// The inverse of [`Self::number`], used by the handler.
     ///
     /// `const fn` over the closed enum rather than a table lookup, so it needs
     /// no static storage and cannot fault.
+    #[cfg(unix)]
     const fn from_raw(sig: libc::c_int) -> Option<Self> {
         if sig == libc::SIGUSR1 {
             Some(Self::Sigusr1)
@@ -318,6 +339,7 @@ static PENDING_ANY: AtomicBool = AtomicBool::new(false);
 
 /// The write end of GNU's self-pipe (`child_signal_write_fd`,
 /// src/process.c:7595).  `-1` until [`install`] creates it.
+#[cfg(unix)]
 static SELF_PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// GNU's `lib_child_handler` (src/process.c:7657), the SIGCHLD handler that
@@ -367,8 +389,10 @@ fn chain_to_previous_sigchld_handler(sig: libc::c_int) {
 /// It is `!Send` and `!Sync` (the `PhantomData<*const ()>`), has no public
 /// constructor, and **no method takes or returns a Lisp `Value`** -- which is
 /// the type-level statement that a handler cannot reach the interpreter.
+#[cfg(unix)]
 struct AsyncSignalScope(std::marker::PhantomData<*const ()>);
 
+#[cfg(unix)]
 impl AsyncSignalScope {
     /// GNU's `p->npending++` (src/keyboard.c:8511) and its
     /// `pending_signals = true` (:8431).
@@ -407,6 +431,7 @@ impl AsyncSignalScope {
 ///
 /// There is exactly one of these in the crate and it is total over
 /// [`HandledSignal`], so a new signal adds no code that runs here.
+#[cfg(unix)]
 extern "C" fn deliver_user_signal(sig: libc::c_int) {
     // GNU preserves errno around the handler ("Races can occur even in
     // single-threaded hosts", src/sysdep.c:1734-1735).
@@ -460,6 +485,7 @@ pub(crate) fn install() -> &'static InstallReport {
     INSTALL.get_or_init(install_once)
 }
 
+#[cfg(unix)]
 fn install_once() -> InstallReport {
     let self_pipe_read_fd = create_self_pipe();
 
@@ -564,6 +590,16 @@ fn install_once() -> InstallReport {
     report
 }
 
+#[cfg(not(unix))]
+fn install_once() -> InstallReport {
+    InstallReport {
+        previous: [],
+        installed: [],
+        self_pipe_read_fd: -1,
+    }
+}
+
+#[cfg(unix)]
 fn classify_previous(old: &libc::sigaction) -> PreviousDisposition {
     match old.sa_sigaction {
         // The seed survived: `sigaction` reported success without writing the
@@ -579,6 +615,7 @@ fn classify_previous(old: &libc::sigaction) -> PreviousDisposition {
 /// GNU's `child_signal_init` (src/process.c:7580-7597): a nonblocking,
 /// close-on-exec pipe whose read end the wait registers and whose write end
 /// the handler pokes.
+#[cfg(unix)]
 fn create_self_pipe() -> libc::c_int {
     let mut fds: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `pipe2` writes exactly two ints through the array.
