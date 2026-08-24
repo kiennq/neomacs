@@ -1,15 +1,52 @@
 use super::RenderApp;
-use super::frame_windows::{FrameLifecycle, NativeTextInputPolicy};
-use super::state::{
-    RenderGpuContext, effective_window_scale_factor, window_size_from_emacs_pixels,
-};
-use super::x11_hints::apply_window_geometry_hints;
+use super::state::RenderGpuContext;
 use crate::thread_comm::InputEvent;
-use std::sync::Arc;
+#[cfg(test)]
+use neovm_core::window::GuiFrameGeometryHints;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::window::Window;
 
 impl RenderApp {
+    pub(super) fn handle_daemon_primary_destroyed(&mut self, emacs_frame_id: u64) -> bool {
+        if !self.lifecycle_flags.daemon_mode
+            || self.frame_windows.primary_window().is_none()
+            || self.frame_windows.primary_frame_id() != Some(emacs_frame_id)
+        {
+            return false;
+        }
+
+        self.comms
+            .send_input(InputEvent::WindowClose { emacs_frame_id });
+        self.frame_windows.take_primary_window();
+        self.frame_windows.clear_primary_mapping();
+        self.lifecycle_flags.primary_deferred = self
+            .frame_windows
+            .promote_active_secondary_to_primary()
+            .is_none();
+        self.lifecycle_flags.shutdown_requested = false;
+        self.frame_coordinator
+            .remove_window(super::frame_sched::NativeWindowId(emacs_frame_id));
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_first_client_as_primary(&mut self, emacs_frame_id: u64) {
+        self.frame_windows.set_primary_pending_request(
+            emacs_frame_id,
+            800,
+            600,
+            "test".to_owned(),
+            GuiFrameGeometryHints {
+                base_width: 0,
+                base_height: 0,
+                min_width: 0,
+                min_height: 0,
+                width_inc: 1,
+                height_inc: 1,
+            },
+        );
+        self.lifecycle_flags.primary_deferred = false;
+    }
+
     fn collect_monitor_snapshot(
         event_loop: &ActiveEventLoop,
     ) -> Vec<crate::thread_comm::MonitorInfo> {
@@ -101,9 +138,7 @@ impl RenderApp {
                     .1,
                 self.frame_windows
                     .primary_window()
-                    .expect("primary window state")
-                    .chrome()
-                    .title
+                    .map_or_else(String::new, |window| window.chrome().title.clone())
             );
             self.lifecycle_flags.resumed_seen = true;
         }
@@ -112,91 +147,7 @@ impl RenderApp {
             .primary_window()
             .is_some_and(|ws| !ws.lifecycle.is_active());
         if needs_native {
-            let (width, height, title, decorations_enabled) = {
-                let primary = self.frame_windows.primary_window().unwrap();
-                let (w, h) = primary.lifecycle.native_size();
-                let chrome = primary.lifecycle.chrome();
-                (w, h, chrome.title.clone(), chrome.decorations_enabled)
-            };
-            let attrs = Window::default_attributes()
-                .with_title(&title)
-                .with_inner_size(window_size_from_emacs_pixels(width, height))
-                .with_decorations(decorations_enabled)
-                .with_transparent(true);
-            let attrs = crate::window_identity::apply_platform_window_identity(attrs);
-
-            tracing::info!(
-                "Render thread creating primary window: emacs_pixels={}x{} title={:?}",
-                width,
-                height,
-                title
-            );
-            match event_loop.create_window(attrs) {
-                Ok(window) => {
-                    let window = Arc::new(window);
-                    NativeTextInputPolicy::for_gui_frame().apply_to_window(&window);
-
-                    if self.clipboard.is_err() {
-                        self.clipboard = crate::clipboard::ClipboardService::for_display(
-                            event_loop.owned_display_handle(),
-                        );
-                        if let Err(err) = &self.clipboard {
-                            tracing::error!("Failed to initialize clipboard service: {err}");
-                        }
-                    }
-
-                    let raw_scale_factor = window.scale_factor();
-                    let effective_scale = effective_window_scale_factor(raw_scale_factor);
-                    {
-                        let primary = self.frame_windows.primary_window_mut().unwrap();
-                        if let FrameLifecycle::Pending { scale_factor, .. } = &mut primary.lifecycle
-                        {
-                            *scale_factor = effective_scale;
-                        }
-                    }
-                    tracing::info!(
-                        "Display scale factor: raw={} effective={}",
-                        raw_scale_factor,
-                        effective_scale
-                    );
-
-                    let phys = window.inner_size();
-                    {
-                        let primary = self.frame_windows.primary_window_mut().unwrap();
-                        if let FrameLifecycle::Pending {
-                            width: pw,
-                            height: ph,
-                            ..
-                        } = &mut primary.lifecycle
-                        {
-                            *pw = phys.width;
-                            *ph = phys.height;
-                        }
-                    }
-                    tracing::info!(
-                        "Render thread: window created (physical {}x{})",
-                        phys.width,
-                        phys.height
-                    );
-
-                    self.init_wgpu(event_loop, window.clone());
-
-                    if let Some(geometry_hints) = self
-                        .frame_windows
-                        .primary_window()
-                        .unwrap()
-                        .lifecycle
-                        .geometry_hints()
-                    {
-                        apply_window_geometry_hints(&window, geometry_hints);
-                    }
-
-                    self.window_icon.apply(&window);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create window: {:?}", e);
-                }
-            }
+            self.create_pending_primary(event_loop);
         }
 
         self.refresh_monitor_snapshot(event_loop, false);
@@ -233,6 +184,7 @@ impl RenderApp {
             event_loop.exit();
             return;
         }
+        self.create_pending_primary(event_loop);
 
         // Decoder workers cannot wake winit directly. Poll their result channel
         // while work is pending so decoded image metadata and pixels become visible.
@@ -664,7 +616,12 @@ impl RenderApp {
             }
         }
 
-        if self.lifecycle_flags.poll_when_idle {
+        if should_arm_legacy_idle_poll(
+            self.lifecycle_flags.poll_when_idle,
+            self.frame_windows
+                .primary_window()
+                .is_some_and(|primary| primary.lifecycle.is_active()),
+        ) {
             self.frame_coordinator.submit_demand(
                 LOOP_WINDOW,
                 FrameDemand {
@@ -674,6 +631,8 @@ impl RenderApp {
                 },
                 now,
             );
+        } else {
+            self.frame_coordinator.remove_window(LOOP_WINDOW);
         }
     }
 
@@ -864,5 +823,55 @@ impl RenderApp {
         }
 
         tracing::info!("GPU resources cleaned up");
+    }
+}
+
+fn should_arm_legacy_idle_poll(poll_when_idle: bool, primary_active: bool) -> bool {
+    poll_when_idle && primary_active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::frame_sched::{
+        Cadence, Damage, DemandReason, FrameCoordinator, FrameDemand, Invalidation, LayerMask,
+        NativeWindowId,
+    };
+    use super::super::state::RenderStartupMode;
+    use super::RenderApp;
+    use std::time::Instant;
+
+    const LOOP_WINDOW: NativeWindowId = NativeWindowId(u64::MAX);
+
+    fn legacy_idle_poll_demand(now: Instant) -> FrameDemand {
+        FrameDemand {
+            invalidation: Invalidation::RepaintLayers {
+                layers: LayerMask::all(),
+                damage: Damage::FullLayer,
+            },
+            cadence: Cadence::At(now + std::time::Duration::from_millis(16)),
+            reason: DemandReason::Redisplay,
+        }
+    }
+
+    #[test]
+    fn pending_primary_does_not_arm_legacy_idle_poll_deadline() {
+        let mut app = RenderApp::new_for_test(RenderStartupMode::DeferredPrimary);
+        app.install_first_client_as_primary(42);
+
+        app.declare_frame_demands(Instant::now());
+
+        assert_eq!(app.frame_coordinator.next_wake_deadline_unserviced(), None);
+    }
+
+    #[test]
+    fn active_primary_still_arms_legacy_idle_poll_deadline() {
+        let mut coordinator = FrameCoordinator::new();
+        let now = Instant::now();
+
+        if super::should_arm_legacy_idle_poll(true, true) {
+            coordinator.submit_demand(LOOP_WINDOW, legacy_idle_poll_demand(now), now);
+        }
+
+        assert!(coordinator.next_wake_deadline_unserviced().is_some());
     }
 }

@@ -673,6 +673,53 @@ pub(super) struct RenderGpuContext {
     pub(super) queue: Arc<wgpu::Queue>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderStartupMode {
+    ImmediatePrimary,
+    DeferredPrimary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrimaryGpuInitialization {
+    Initialize,
+    RebuildAfterLoss,
+    Reuse,
+}
+
+pub(super) const fn primary_gpu_initialization_plan(
+    has_gpu: bool,
+    has_renderer: bool,
+    recovery_deferred: bool,
+) -> PrimaryGpuInitialization {
+    if recovery_deferred {
+        PrimaryGpuInitialization::RebuildAfterLoss
+    } else if has_gpu && has_renderer {
+        PrimaryGpuInitialization::Reuse
+    } else {
+        PrimaryGpuInitialization::Initialize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeviceRecoveryTarget {
+    Primary,
+    SurvivingSecondary,
+    Deferred,
+}
+
+pub(super) const fn device_recovery_target(
+    primary_active: bool,
+    secondary_active: bool,
+) -> DeviceRecoveryTarget {
+    if primary_active {
+        DeviceRecoveryTarget::Primary
+    } else if secondary_active {
+        DeviceRecoveryTarget::SurvivingSecondary
+    } else {
+        DeviceRecoveryTarget::Deferred
+    }
+}
+
 pub(super) struct RenderApp {
     pub(super) comms: RenderComms,
 
@@ -767,6 +814,10 @@ pub(super) struct RenderApp {
     /// Demand-driven frame scheduler: owns per-window redraw coalescing and
     /// wake deadlines (frame scheduling plan, Stage 2).
     pub(super) frame_coordinator: super::frame_sched::FrameCoordinator,
+    #[cfg(test)]
+    pub(super) full_gpu_initializations: usize,
+    #[cfg(test)]
+    pub(super) primary_surface_creations: usize,
 }
 
 pub(super) struct RenderLifecycle {
@@ -774,15 +825,21 @@ pub(super) struct RenderLifecycle {
     pub about_to_wait_seen: bool,
     pub poll_when_idle: bool,
     pub shutdown_requested: bool,
+    pub daemon_mode: bool,
+    pub primary_deferred: bool,
+    pub device_recovery_deferred: bool,
 }
 
 impl RenderLifecycle {
-    pub fn new(poll_when_idle: bool) -> Self {
+    pub fn new(poll_when_idle: bool, startup_mode: RenderStartupMode) -> Self {
         Self {
             resumed_seen: false,
             about_to_wait_seen: false,
             poll_when_idle,
             shutdown_requested: false,
+            daemon_mode: startup_mode == RenderStartupMode::DeferredPrimary,
+            primary_deferred: startup_mode == RenderStartupMode::DeferredPrimary,
+            device_recovery_deferred: false,
         }
     }
 }
@@ -841,6 +898,7 @@ impl RenderApp {
         self.render_policy = next_policy;
     }
 
+    #[cfg(test)]
     pub(super) fn new(
         comms: RenderComms,
         width: u32,
@@ -851,26 +909,40 @@ impl RenderApp {
         poll_when_idle: bool,
         #[cfg(feature = "neo-term")] shared_terminals: crate::terminal::SharedTerminals,
     ) -> Self {
+        Self::new_with_startup_mode(
+            comms,
+            width,
+            height,
+            title,
+            image_metadata,
+            shared_monitors,
+            poll_when_idle,
+            RenderStartupMode::ImmediatePrimary,
+            #[cfg(feature = "neo-term")]
+            shared_terminals,
+        )
+    }
+
+    pub(super) fn new_with_startup_mode(
+        comms: RenderComms,
+        width: u32,
+        height: u32,
+        title: String,
+        image_metadata: SharedImageMetadata,
+        shared_monitors: SharedMonitorInfo,
+        poll_when_idle: bool,
+        startup_mode: RenderStartupMode,
+        #[cfg(feature = "neo-term")] shared_terminals: crate::terminal::SharedTerminals,
+    ) -> Self {
         #[cfg(feature = "wpe-webkit")]
         let webkit_import_policy = WebKitImportPolicy::from_env();
 
         let mut frame_windows = GuiFrameWindowManager::new();
-        frame_windows.set_primary_pending(GuiFrameWindowState {
-            lifecycle: FrameLifecycle::Pending {
-                width,
-                height,
-                scale_factor: 1.0,
-                mouse_hidden_for_typing: false,
-                ime_enabled: false,
-                last_ime_cursor_area: None,
-                chrome: WindowChrome {
-                    title,
-                    ..WindowChrome::default()
-                },
-                geometry_hints: None,
-            },
-            render: GuiFrameRenderState::new_without_device(0, false),
-        });
+        if startup_mode == RenderStartupMode::ImmediatePrimary {
+            frame_windows.set_primary_pending(GuiFrameWindowState::pending(
+                0, width, height, title, None, false,
+            ));
+        }
 
         let requested_visual_config = VisualConfig::default();
         let backend_profile = RenderBackendProfile::pending();
@@ -939,8 +1011,30 @@ impl RenderApp {
                     0
                 }
             }),
-            lifecycle_flags: RenderLifecycle::new(poll_when_idle),
+            lifecycle_flags: RenderLifecycle::new(poll_when_idle, startup_mode),
             frame_coordinator: super::frame_sched::FrameCoordinator::new(),
+            #[cfg(test)]
+            full_gpu_initializations: 0,
+            #[cfg(test)]
+            primary_surface_creations: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(startup_mode: RenderStartupMode) -> Self {
+        let comms = crate::thread_comm::ThreadComms::new();
+        let (_emacs, render) = comms.split();
+        Self::new_with_startup_mode(
+            render,
+            800,
+            600,
+            "test".to_owned(),
+            Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
+            Arc::new((Mutex::new(Vec::new()), Condvar::new())),
+            true,
+            startup_mode,
+            #[cfg(feature = "neo-term")]
+            crate::terminal::new_shared_terminals(),
+        )
     }
 }

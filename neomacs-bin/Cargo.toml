@@ -81,15 +81,18 @@ mimalloc = { version = "0.1", optional = true, default-features = false }
 libmimalloc-sys = { version = "0.1", optional = true, default-features = false, features = ["extended"] }
 tikv-jemallocator = { version = "0.7", optional = true, default-features = false }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemalloc-sys = { version = "0.7", optional = true, default-features = false }
-
 # Utilities
 tracing.workspace = true
 crossbeam-channel.workspace = true
 libc.workspace = true
 signal-hook.workspace = true
 crossterm = "0.29"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemalloc-sys = { version = "0.7", optional = true, default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 hostname.workspace = true

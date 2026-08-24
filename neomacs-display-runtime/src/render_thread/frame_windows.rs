@@ -1623,6 +1623,32 @@ impl FrameLifecycle {
 }
 
 impl GuiFrameWindowState {
+    pub(super) fn pending(
+        emacs_frame_id: u64,
+        width: u32,
+        height: u32,
+        title: String,
+        geometry_hints: Option<GuiFrameGeometryHints>,
+        fps_enabled: bool,
+    ) -> Self {
+        Self {
+            lifecycle: FrameLifecycle::Pending {
+                width,
+                height,
+                scale_factor: 1.0,
+                mouse_hidden_for_typing: false,
+                ime_enabled: false,
+                last_ime_cursor_area: None,
+                chrome: WindowChrome {
+                    title,
+                    ..WindowChrome::default()
+                },
+                geometry_hints,
+            },
+            render: GuiFrameRenderState::new_without_device(emacs_frame_id, fps_enabled),
+        }
+    }
+
     pub fn handle_resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let scale = DeviceScale::new(self.lifecycle.scale_factor() as f32)
             .expect("effective window scale is finite and positive");
@@ -2042,7 +2068,6 @@ impl GuiFrameWindowManager {
         self.sync_primary_mapping();
     }
 
-    #[allow(dead_code)] // used by the frame-window manager tests
     pub fn primary_frame_id(&self) -> Option<u64> {
         self.primary_emacs_frame_id
     }
@@ -2070,6 +2095,25 @@ impl GuiFrameWindowManager {
     pub(super) fn set_primary_pending(&mut self, window_state: GuiFrameWindowState) {
         self.windows.insert(FrameKey::Pending, window_state);
         self.sync_primary_mapping();
+    }
+
+    pub(super) fn set_primary_pending_request(
+        &mut self,
+        emacs_frame_id: u64,
+        width: u32,
+        height: u32,
+        title: String,
+        geometry_hints: GuiFrameGeometryHints,
+    ) {
+        self.set_primary_pending(GuiFrameWindowState::pending(
+            emacs_frame_id,
+            width,
+            height,
+            title,
+            Some(geometry_hints),
+            self.fps_enabled,
+        ));
+        self.adopt_primary_frame_id(emacs_frame_id);
     }
 
     pub(super) fn populate_primary_native(&mut self, native: GuiFrameNativeWindowState) {
@@ -2108,10 +2152,48 @@ impl GuiFrameWindowManager {
     }
 
     pub fn clear_primary_mapping(&mut self) {
+        let old_emacs_frame_id = self.primary_emacs_frame_id;
         if let Some(winit_id) = self.primary_winit_id.take() {
             self.winit_to_emacs.remove(&winit_id);
         }
+        if let Some(old_emacs_frame_id) = old_emacs_frame_id {
+            self.winit_to_emacs
+                .retain(|_, frame_id| *frame_id != old_emacs_frame_id);
+        }
         self.primary_emacs_frame_id = None;
+    }
+
+    /// Promote a surviving active secondary window after daemon primary loss.
+    ///
+    /// Keeping one native top-level window as primary lets device recovery
+    /// proceed while the evaluator deletes the lost GUI frame. A pending
+    /// primary is never displaced; the daemon close path clears it before
+    /// asking for promotion.
+    pub(super) fn promote_active_secondary_to_primary(&mut self) -> Option<u64> {
+        if self.primary_emacs_frame_id.is_some() || self.primary_window().is_some() {
+            return None;
+        }
+        let candidate = self.windows.iter().find_map(|(key, state)| {
+            let FrameKey::Adopted(emacs_frame_id) = key else {
+                return None;
+            };
+            state
+                .lifecycle
+                .native()
+                .map(|native| (*emacs_frame_id, native.window.id()))
+        })?;
+        self.primary_emacs_frame_id = Some(candidate.0);
+        self.primary_winit_id = Some(candidate.1);
+        self.sync_primary_mapping();
+        Some(candidate.0)
+    }
+
+    pub(super) fn has_active_secondary_native_window(&self) -> bool {
+        self.windows.iter().any(|(key, state)| {
+            matches!(key, FrameKey::Adopted(frame_id)
+                if self.primary_emacs_frame_id != Some(*frame_id))
+                && state.lifecycle.is_active()
+        })
     }
 
     fn sync_primary_mapping(&mut self) {

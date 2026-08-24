@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Stdio;
 use std::process::{self, Command};
 use std::time::Duration;
 
@@ -13,6 +15,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use neovm_core::GNU_EMACS_VERSION;
+use neovm_core::local_socket::{connect_stream, socket_path_for_name, stream_supported};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum FrameRequest {
@@ -114,6 +117,13 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
         .unwrap_or("neomacsclient")
         .to_string();
     let options = parse_options(&prog, argv.into_iter().skip(1))?;
+
+    #[cfg(not(unix))]
+    if options.frame == FrameRequest::NewTty {
+        return Err(format!(
+            "{prog}: creating a TTY frame is not supported on this platform"
+        ));
+    }
 
     if !(options.eval || options.frame.creates_frame() || !options.args.is_empty()) {
         return Err(format!(
@@ -266,90 +276,117 @@ Options:
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ServerTarget {
+    Local(PathBuf),
+    Tcp(PathBuf),
+}
+
+enum ClientConnectError {
+    Connection(String),
+    Other(String),
+}
+
+impl ClientConnectError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Connection(message) | Self::Other(message) => message,
+        }
+    }
+}
+
 fn run_client(prog: &str, options: Options) -> Result<(), String> {
-    if let Some(server_file) = options
+    match try_client(prog, &options) {
+        Ok(()) => Ok(()),
+        Err(ClientConnectError::Connection(_message))
+            if options.alternate_editor.as_deref() == Some("") =>
+        {
+            start_daemon_and_retry(prog, options)
+        }
+        Err(error @ ClientConnectError::Connection(_)) => {
+            fail_or_alternate(prog, &options, error.message())
+        }
+        Err(ClientConnectError::Other(message)) => Err(format!("{prog}: {message}")),
+    }
+}
+
+fn resolve_server_target(options: &Options) -> Result<ServerTarget, String> {
+    resolve_server_target_with(options, stream_supported())
+}
+
+fn resolve_server_target_with(
+    options: &Options,
+    local_supported: bool,
+) -> Result<ServerTarget, String> {
+    if let Some(server_file) = selected_server_file(options) {
+        return Ok(ServerTarget::Tcp(PathBuf::from(server_file)));
+    }
+
+    let name = selected_socket_name(options);
+    if local_supported {
+        return match socket_path_for_name(&name) {
+            Ok(path) => Ok(ServerTarget::Local(path)),
+            Err(error)
+                if cfg!(windows)
+                    && !is_path_like_socket_name(&name)
+                    && error.to_string() == "no usable local socket directory" =>
+            {
+                Ok(ServerTarget::Tcp(PathBuf::from(name)))
+            }
+            Err(error) => Err(format!(
+                "cannot resolve local socket path for {name}: {error}"
+            )),
+        };
+    }
+
+    Ok(ServerTarget::Tcp(PathBuf::from(name)))
+}
+
+fn is_path_like_socket_name(name: &str) -> bool {
+    let path = Path::new(name);
+    path.is_absolute() || name.contains('/') || name.contains('\\')
+}
+
+fn selected_server_file(options: &Options) -> Option<String> {
+    options
         .server_file
         .clone()
         .or_else(|| env::var("EMACS_SERVER_FILE").ok())
-    {
-        return run_tcp_client(prog, options, &server_file);
-    }
+}
 
-    #[cfg(unix)]
-    {
-        run_unix_client(prog, options)
-    }
+fn selected_socket_name(options: &Options) -> String {
+    options
+        .socket_name
+        .clone()
+        .or_else(|| env::var("EMACS_SOCKET_NAME").ok())
+        .unwrap_or_else(|| "server".to_string())
+}
 
-    #[cfg(not(unix))]
-    {
-        Err(format!(
-            "{prog}: local socket mode is unsupported on this platform; use --server-file"
-        ))
+fn try_client(_prog: &str, options: &Options) -> Result<(), ClientConnectError> {
+    let target = resolve_server_target(options).map_err(ClientConnectError::Connection)?;
+    match target {
+        ServerTarget::Local(socket) => run_local_client(options, &socket),
+        ServerTarget::Tcp(server_file) => run_tcp_client(options, &server_file),
     }
 }
 
-#[cfg(unix)]
-fn run_unix_client(prog: &str, options: Options) -> Result<(), String> {
-    let socket = resolve_socket_path(&options)?;
-    let mut stream = match std::os::unix::net::UnixStream::connect(&socket) {
+fn run_local_client(options: &Options, socket: &Path) -> Result<(), ClientConnectError> {
+    let mut stream = match connect_stream(socket) {
         Ok(stream) => stream,
         Err(err) => {
-            return fail_or_alternate(
-                prog,
-                &options,
-                &format!("can't connect to {}: {err}", socket.display()),
-            );
+            return Err(ClientConnectError::Connection(format!(
+                "can't connect to {}: {err}",
+                socket.display()
+            )));
         }
     };
     if let Some(timeout) = options.timeout {
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|err| format!("failed to set socket timeout: {err}"))?;
+        stream.set_read_timeout(Some(timeout)).map_err(|err| {
+            ClientConnectError::Other(format!("failed to set socket timeout: {err}"))
+        })?;
     }
 
-    let request = build_request(&options)?;
-    let lifecycle = (options.frame == FrameRequest::NewTty)
-        .then(|| {
-            stream
-                .try_clone()
-                .map_err(|err| format!("failed to clone server connection: {err}"))
-                .and_then(TtyLifecycle::start)
-        })
-        .transpose()?;
-    if let Some(lifecycle) = &lifecycle {
-        lifecycle.write_request(request.as_bytes())?;
-    } else {
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|err| format!("failed to send request to server: {err}"))?;
-    }
-    read_responses(&mut stream, &options, lifecycle.as_ref())
-}
-
-fn run_tcp_client(prog: &str, options: Options, server_file: &str) -> Result<(), String> {
-    let config = match read_tcp_server_config(server_file) {
-        Ok(config) => config,
-        Err(err) => return fail_or_alternate(prog, &options, &err),
-    };
-    let mut stream = match TcpStream::connect((&*config.host, config.port)) {
-        Ok(stream) => stream,
-        Err(err) => {
-            return fail_or_alternate(
-                prog,
-                &options,
-                &format!("can't connect to {}:{}: {err}", config.host, config.port),
-            );
-        }
-    };
-    if let Some(timeout) = options.timeout {
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|err| format!("failed to set socket timeout: {err}"))?;
-    }
-
-    let mut request = String::new();
-    push_arg_command(&mut request, "-auth", &config.auth_key);
-    request.push_str(&build_request(&options)?);
+    let request = build_request(options).map_err(ClientConnectError::Other)?;
     #[cfg(unix)]
     let lifecycle = (options.frame == FrameRequest::NewTty)
         .then(|| {
@@ -358,22 +395,78 @@ fn run_tcp_client(prog: &str, options: Options, server_file: &str) -> Result<(),
                 .map_err(|err| format!("failed to clone server connection: {err}"))
                 .and_then(TtyLifecycle::start)
         })
-        .transpose()?;
+        .transpose()
+        .map_err(ClientConnectError::Other)?;
     #[cfg(not(unix))]
     let lifecycle: Option<TtyLifecycle> = None;
     #[cfg(unix)]
     if let Some(lifecycle) = &lifecycle {
-        lifecycle.write_request(request.as_bytes())?;
+        lifecycle
+            .write_request(request.as_bytes())
+            .map_err(ClientConnectError::Other)?;
     } else {
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|err| format!("failed to send request to server: {err}"))?;
+        stream.write_all(request.as_bytes()).map_err(|err| {
+            ClientConnectError::Other(format!("failed to send request to server: {err}"))
+        })?;
     }
     #[cfg(not(unix))]
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|err| format!("failed to send request to server: {err}"))?;
-    read_responses(&mut stream, &options, lifecycle.as_ref())
+    stream.write_all(request.as_bytes()).map_err(|err| {
+        ClientConnectError::Other(format!("failed to send request to server: {err}"))
+    })?;
+    read_responses(&mut stream, options, lifecycle.as_ref()).map_err(ClientConnectError::Other)
+}
+
+fn run_tcp_client(options: &Options, server_file: &Path) -> Result<(), ClientConnectError> {
+    let server_file = server_file.to_string_lossy();
+    let config = match read_tcp_server_config(&server_file) {
+        Ok(config) => config,
+        Err(err) => return Err(ClientConnectError::Connection(err)),
+    };
+    let mut stream = match TcpStream::connect((&*config.host, config.port)) {
+        Ok(stream) => stream,
+        Err(err) => {
+            return Err(ClientConnectError::Connection(format!(
+                "can't connect to {}:{}: {err}",
+                config.host, config.port
+            )));
+        }
+    };
+    if let Some(timeout) = options.timeout {
+        stream.set_read_timeout(Some(timeout)).map_err(|err| {
+            ClientConnectError::Other(format!("failed to set socket timeout: {err}"))
+        })?;
+    }
+
+    let mut request = String::new();
+    push_arg_command(&mut request, "-auth", &config.auth_key);
+    request.push_str(&build_request(options).map_err(ClientConnectError::Other)?);
+    #[cfg(unix)]
+    let lifecycle = (options.frame == FrameRequest::NewTty)
+        .then(|| {
+            stream
+                .try_clone()
+                .map_err(|err| format!("failed to clone server connection: {err}"))
+                .and_then(TtyLifecycle::start)
+        })
+        .transpose()
+        .map_err(ClientConnectError::Other)?;
+    #[cfg(not(unix))]
+    let lifecycle: Option<TtyLifecycle> = None;
+    #[cfg(unix)]
+    if let Some(lifecycle) = &lifecycle {
+        lifecycle
+            .write_request(request.as_bytes())
+            .map_err(ClientConnectError::Other)?;
+    } else {
+        stream.write_all(request.as_bytes()).map_err(|err| {
+            ClientConnectError::Other(format!("failed to send request to server: {err}"))
+        })?;
+    }
+    #[cfg(not(unix))]
+    stream.write_all(request.as_bytes()).map_err(|err| {
+        ClientConnectError::Other(format!("failed to send request to server: {err}"))
+    })?;
+    read_responses(&mut stream, options, lifecycle.as_ref()).map_err(ClientConnectError::Other)
 }
 
 struct TcpServerConfig {
@@ -423,71 +516,56 @@ fn resolve_tcp_server_file(server_file: &str) -> Option<PathBuf> {
         return path.exists().then(|| path.to_path_buf());
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let emacs_d = PathBuf::from(&home)
-            .join(".emacs.d")
-            .join("server")
-            .join(server_file);
-        if emacs_d.exists() {
-            return Some(emacs_d);
-        }
+    tcp_server_file_candidates(server_file)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn tcp_server_file_candidates(name: &str) -> Vec<PathBuf> {
+    let home = effective_home();
+    let xdg = env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    tcp_server_file_candidates_from_paths(name, home.as_deref(), xdg.as_deref())
+}
+
+fn tcp_server_file_candidates_from_paths(
+    name: &str,
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(3);
+
+    if let Some(home) = home {
+        candidates.push(home.join(".emacs.d").join("server").join(name));
+    }
+    if let Some(xdg) = xdg {
+        candidates.push(xdg.join("emacs").join("server").join(name));
+    }
+    if let Some(home) = home {
+        candidates.push(home.join(".config").join("emacs").join("server").join(name));
     }
 
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        let xdg_path = PathBuf::from(xdg)
-            .join("emacs")
-            .join("server")
-            .join(server_file);
-        if xdg_path.exists() {
-            return Some(xdg_path);
-        }
-    } else if let Some(home) = env::var_os("HOME") {
-        let config_path = PathBuf::from(home)
-            .join(".config")
-            .join("emacs")
-            .join("server")
-            .join(server_file);
-        if config_path.exists() {
-            return Some(config_path);
-        }
-    }
+    candidates
+}
 
+fn effective_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("APPDATA").filter(|value| !value.is_empty()))
+        .or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .or_else(existing_platform_home_fallback)
+}
+
+#[cfg(windows)]
+fn existing_platform_home_fallback() -> Option<PathBuf> {
+    Some(PathBuf::from(r"C:\"))
+}
+
+#[cfg(not(windows))]
+fn existing_platform_home_fallback() -> Option<PathBuf> {
     None
-}
-
-#[cfg(unix)]
-fn resolve_socket_path(options: &Options) -> Result<PathBuf, String> {
-    if let Some(socket) = options
-        .socket_name
-        .clone()
-        .or_else(|| env::var("EMACS_SOCKET_NAME").ok())
-    {
-        return Ok(socket_path_from_name(&socket));
-    }
-
-    Ok(socket_path_from_name("server"))
-}
-
-#[cfg(unix)]
-fn socket_path_from_name(name: &str) -> PathBuf {
-    let path = Path::new(name);
-    if path.components().count() > 1 || path.is_absolute() {
-        return path.to_path_buf();
-    }
-
-    if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-        return Path::new(&runtime_dir).join("emacs").join(name);
-    }
-
-    let tmp = env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
-    PathBuf::from(tmp)
-        .join(format!("emacs{}", effective_uid()))
-        .join(name)
-}
-
-#[cfg(unix)]
-fn effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
 }
 
 fn build_request(options: &Options) -> Result<String, String> {
@@ -600,7 +678,8 @@ fn effective_display(options: &Options) -> Option<String> {
                 env::var("DISPLAY")
                     .ok()
                     .filter(|display| !display.is_empty())
-            });
+            })
+            .or_else(|| Some("neomacs".to_string()));
     }
     None
 }
@@ -699,6 +778,8 @@ fn read_responses(
             && let Some(lifecycle) = lifecycle
         {
             lifecycle.stop_from_server();
+        } else if line.trim_end() == "-window-system-unsupported" {
+            return Err("server does not support creating a window-system frame".to_string());
         }
     }
 
@@ -811,18 +892,222 @@ impl Drop for TtyLifecycle {
     }
 }
 
+fn selected_server_name(options: &Options) -> String {
+    if let Some(server_file) = selected_server_file(options) {
+        if let Some(name) = Path::new(&server_file)
+            .file_name()
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string_lossy().into_owned();
+        }
+        return server_file;
+    }
+
+    selected_socket_name(options)
+}
+
+fn elisp_string_literal(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => literal.push_str(r"\\"),
+            '"' => literal.push_str(r#"\""#),
+            '\n' => literal.push_str(r"\n"),
+            '\r' => literal.push_str(r"\r"),
+            '\t' => literal.push_str(r"\t"),
+            '\x08' => literal.push_str(r"\b"),
+            '\x0c' => literal.push_str(r"\f"),
+            ch if ch.is_control() => {
+                write!(literal, r"\u{:04X}", ch as u32).expect("writing to String cannot fail");
+            }
+            ch => literal.push(ch),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+fn daemon_arguments(options: &Options) -> Result<Vec<OsString>, String> {
+    daemon_arguments_with(options, stream_supported())
+}
+
+fn daemon_arguments_with(
+    options: &Options,
+    local_supported: bool,
+) -> Result<Vec<OsString>, String> {
+    let daemon_name = selected_server_name(options);
+    let daemon_argument = OsString::from(format!("--daemon={daemon_name}"));
+
+    if let Some(server_file) = selected_server_file(options) {
+        let server_file = daemon_server_file(&server_file)?;
+        let parent = server_file.parent().unwrap_or_else(|| Path::new("."));
+        let config = format!(
+            "(setq server-use-tcp t server-auth-dir {})",
+            elisp_string_literal(&parent.to_string_lossy())
+        );
+        return Ok(vec![
+            OsString::from("--eval"),
+            OsString::from(config),
+            daemon_argument,
+        ]);
+    }
+
+    if cfg!(windows) && !local_supported {
+        let server_file = daemon_server_file(&selected_server_name(options))?;
+        let parent = server_file.parent().unwrap_or_else(|| Path::new("."));
+        let config = format!(
+            "(setq server-use-tcp t server-auth-dir {})",
+            elisp_string_literal(&parent.to_string_lossy())
+        );
+        return Ok(vec![
+            OsString::from("--eval"),
+            OsString::from(config),
+            daemon_argument,
+        ]);
+    }
+
+    Ok(vec![daemon_argument])
+}
+
+fn daemon_server_file(server_file: &str) -> Result<PathBuf, String> {
+    let path = Path::new(server_file);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let mut candidates = tcp_server_file_candidates(server_file);
+    if let Some(existing) = candidates.iter().find(|candidate| candidate.exists()) {
+        return Ok(existing.clone());
+    }
+
+    candidates
+        .drain(..)
+        .next()
+        .ok_or_else(|| format!("cannot determine an authentication directory for {server_file}"))
+}
+
+fn find_neomacs_executable() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    let executable_names: &[&str] = if cfg!(windows) {
+        &["neomacs.exe", "neomacs"]
+    } else {
+        &["neomacs"]
+    };
+    for variable in ["NEOMACS", "EMACS"] {
+        if let Some(path) = env::var_os(variable).filter(|path| !path.is_empty()) {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        candidates.extend(executable_names.iter().map(|name| parent.join(name)));
+    }
+
+    if let Some(path) = env::var_os("PATH") {
+        candidates.extend(env::split_paths(&path).flat_map(|directory| {
+            executable_names
+                .iter()
+                .map(move |name| directory.join(name))
+        }));
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| {
+            "could not find neomacs executable (checked NEOMACS, EMACS, the sibling executable, and PATH)"
+                .to_string()
+        })
+}
+
+fn start_daemon_and_retry(prog: &str, options: Options) -> Result<(), String> {
+    let executable = find_neomacs_executable().map_err(|err| format!("{prog}: {err}"))?;
+    start_daemon_and_retry_with_runner(prog, options, &executable, |executable, args| {
+        #[cfg(windows)]
+        clear_standard_handle_inheritance()?;
+        let mut command = Command::new(executable);
+        command.args(args);
+        #[cfg(windows)]
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = command
+            .status()
+            .map_err(|err| format!("failed to launch daemon: {err}"))?;
+        Ok(status.success())
+    })
+}
+
+#[cfg(windows)]
+fn clear_standard_handle_inheritance() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(kind) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(format!(
+                "failed to detach standard handle inheritance: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn start_daemon_and_retry_with_runner<F>(
+    prog: &str,
+    options: Options,
+    executable: &Path,
+    run_daemon: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path, &[OsString]) -> Result<bool, String>,
+{
+    let daemon_arguments = daemon_arguments(&options)?;
+    let launch_result = run_daemon(executable, &daemon_arguments);
+
+    match try_client(prog, &options) {
+        Ok(()) => Ok(()),
+        Err(retry_error) => match launch_result {
+            Ok(true) => Err(format!("{prog}: {}", retry_error.message())),
+            Ok(false) => Err(format!(
+                "{prog}: daemon command exited unsuccessfully; {}",
+                retry_error.message()
+            )),
+            Err(launch_error) => Err(format!("{prog}: {launch_error}; {}", retry_error.message())),
+        },
+    }
+}
+
 fn fail_or_alternate(prog: &str, options: &Options, message: &str) -> Result<(), String> {
     let Some(alternate) = &options.alternate_editor else {
         return Err(format!("{prog}: {message}"));
     };
     if alternate.is_empty() {
-        return Err(format!(
-            "{prog}: automatic daemon startup is not implemented in neomacsclient yet"
-        ));
+        return Err(format!("{prog}: {message}"));
     }
 
-    let status = Command::new("sh")
-        .arg("-c")
+    #[cfg(unix)]
+    let (shell, shell_arg) = ("sh", "-c");
+    #[cfg(windows)]
+    let (shell, shell_arg) = ("cmd", "/C");
+
+    let status = Command::new(shell)
+        .arg(shell_arg)
         .arg(alternate)
         .args(&options.args)
         .status()

@@ -3723,6 +3723,7 @@ dependencies = [
  "tikv-jemallocator",
  "tracing",
  "vergen-gitcl",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3837,7 +3838,9 @@ version = "0.0.16"
 dependencies = [
  "getrandom 0.4.3",
  "image",
+ "neovm-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
