@@ -96,6 +96,7 @@ cfg_select! {
 
 mod args;
 mod build_info;
+mod daemon;
 pub(crate) mod frame_layout;
 mod image_catalog;
 mod input_bridge;
@@ -123,8 +124,8 @@ use neomacs_display_runtime::render_thread::run_render_loop_current_thread;
 #[cfg(feature = "neo-term")]
 use neomacs_display_runtime::render_thread::run_render_loop_current_thread_with_terminals;
 use neomacs_display_runtime::render_thread::{
-    RenderEventLoop, RenderEventLoopProxy, RenderUserEvent, SharedImageRenderState,
-    SharedMonitorInfo, build_render_event_loop,
+    RenderEventLoop, RenderEventLoopProxy, RenderStartupMode, RenderUserEvent,
+    SharedImageRenderState, SharedMonitorInfo, build_render_event_loop,
 };
 use neomacs_display_runtime::shader_surface::{
     SurfaceChannelSource as RendererChannelSource, SurfaceShaderLanguage as RendererShaderLanguage,
@@ -157,6 +158,7 @@ use neomacs_webview::{
 use neovm_core::buffer::{BufferId, EmacsBytePos, EmacsByteRange, LispCharPos1};
 use neovm_core::emacs_core::Value;
 use neovm_core::emacs_core::builtins::set_neomacs_monitor_info;
+use neovm_core::emacs_core::daemon::DaemonRequest;
 use neovm_core::emacs_core::display::gui_window_system_symbol;
 use neovm_core::emacs_core::display_host::{
     AvailableFontFamilyName, FontResolveRequest, FrameFontRequest, XwidgetScriptRequestId,
@@ -241,8 +243,13 @@ fn log_target_for(
     mode: RuntimeMode,
     frontend: FrontendKind,
     console_logging_requested: bool,
+    daemon: bool,
 ) -> neovm_core::logging::LogTarget {
     use neovm_core::logging::LogTarget;
+
+    if daemon {
+        return LogTarget::File;
+    }
 
     match mode {
         RuntimeMode::Raw | RuntimeMode::BootstrapUse => LogTarget::Stdout,
@@ -282,8 +289,10 @@ where
 pub(crate) struct StartupOptions {
     frontend: FrontendKind,
     forwarded_args: Vec<String>,
+    raw_args: Vec<OsString>,
     terminal_device: Option<String>,
     noninteractive: bool,
+    daemon: Option<DaemonRequest>,
     temacs_mode: Option<LoadupDumpMode>,
     dump_file_override: Option<PathBuf>,
     /// Set by `-Q` (peek) and `-x` (consumed). Mirrors GNU
@@ -540,6 +549,67 @@ fn render_startup_image_error(err: &neovm_core::emacs_core::error::EvalError) ->
     }
 }
 
+#[cfg(windows)]
+fn server_socket_env_value(existing: Option<&std::ffi::OsStr>, prepared: &Path) -> OsString {
+    existing
+        .filter(|value| !value.is_empty())
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| prepared.as_os_str().to_os_string())
+}
+
+#[cfg(windows)]
+fn configure_server_socket_directory() -> Result<(), String> {
+    if !neovm_core::local_socket::stream_supported() {
+        return Ok(());
+    }
+
+    let existing = std::env::var_os("NEOMACS_SERVER_SOCKET_DIR").filter(|value| !value.is_empty());
+    let selected = neovm_core::local_socket::socket_directory().map_err(|error| {
+        format!("neomacs: failed to select local server socket directory: {error}")
+    })?;
+    unsafe {
+        std::env::set_var(
+            "NEOMACS_SERVER_SOCKET_DIR",
+            server_socket_env_value(existing.as_deref(), &selected),
+        );
+    }
+    Ok(())
+}
+
+fn daemon_request_from_arg(arg: &str) -> Option<DaemonRequest> {
+    let (foreground, name) = if arg == "-daemon" || arg == "--daemon" {
+        (false, None)
+    } else if let Some(name) = arg
+        .strip_prefix("-daemon=")
+        .or_else(|| arg.strip_prefix("--daemon="))
+    {
+        (false, Some(name))
+    } else if arg == "-bg-daemon" || arg == "--bg-daemon" {
+        (false, None)
+    } else if let Some(name) = arg
+        .strip_prefix("-bg-daemon=")
+        .or_else(|| arg.strip_prefix("--bg-daemon="))
+    {
+        (false, Some(name))
+    } else if arg == "-fg-daemon" || arg == "--fg-daemon" {
+        (true, None)
+    } else if let Some(name) = arg
+        .strip_prefix("-fg-daemon=")
+        .or_else(|| arg.strip_prefix("--fg-daemon="))
+    {
+        (true, Some(name))
+    } else {
+        return None;
+    };
+
+    let name = name.map(str::to_owned);
+    Some(if foreground {
+        DaemonRequest::Foreground { name }
+    } else {
+        DaemonRequest::Background { name }
+    })
+}
+
 fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<StartupOptions, String> {
     use args::{ArgMatch, argmatch, sort_args};
 
@@ -550,6 +620,13 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
     // is `*skipptr` — `argmatch` looks at `parsed[idx + 1]` so an idx of
     // 0 means "look at the first user token".
     let mut parsed: Vec<String> = args.into_iter().collect();
+    let raw_args = parsed.iter().cloned().map(OsString::from).collect();
+    let daemon_option_count = parsed
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .filter(|arg| daemon_request_from_arg(arg).is_some())
+        .count();
 
     // GNU emacs.c:1502 — sort_args runs once before the main matching
     // pass so the parser walks argv in canonical priority order. This
@@ -567,6 +644,10 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
     let mut frontend = FrontendKind::Gui;
     let mut terminal_device = None;
     let mut noninteractive = false;
+    let mut batch_requested = false;
+    let mut script_requested = false;
+    let mut no_window_system = false;
+    let mut daemon = None;
     let mut temacs_mode = None;
     let mut dump_file_override = None;
     let mut no_site_lisp = false;
@@ -588,6 +669,12 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
         if next == "--" {
             forwarded_args.extend(parsed[idx + 1..].iter().cloned());
             break;
+        }
+
+        if let Some(request) = daemon_request_from_arg(next) {
+            daemon = Some(request);
+            idx += 1;
+            continue;
         }
 
         // -chdir / --chdir DIR (GNU emacs.c:1538-1561). Must run before
@@ -620,6 +707,7 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
         ) {
             ArgMatch::Bare => {
                 frontend = FrontendKind::Tty;
+                no_window_system = true;
                 continue;
             }
             ArgMatch::NoMatch => {}
@@ -628,6 +716,7 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
         match argmatch(&parsed, &mut idx, "-nw", Some("--no-windows"), 6, false) {
             ArgMatch::Bare => {
                 frontend = FrontendKind::Tty;
+                no_window_system = true;
                 continue;
             }
             ArgMatch::NoMatch => {}
@@ -639,6 +728,7 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
             ArgMatch::Bare => {
                 noninteractive = true;
                 frontend = FrontendKind::Tty;
+                batch_requested = true;
                 continue;
             }
             ArgMatch::NoMatch => {}
@@ -656,6 +746,7 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
             ArgMatch::Value(script_file) => {
                 noninteractive = true;
                 frontend = FrontendKind::Tty;
+                script_requested = true;
                 forwarded_args.push("-scriptload".to_string());
                 forwarded_args.push(script_file);
                 continue;
@@ -870,11 +961,29 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
         no_site_lisp = true;
     }
 
+    if daemon_option_count > 1 {
+        return Err("neomacs: more than one daemon option was specified".to_string());
+    }
+    if daemon.is_some() && batch_requested {
+        return Err("neomacs: daemon mode cannot be used with --batch".to_string());
+    }
+    if daemon.is_some() && script_requested {
+        return Err("neomacs: daemon mode cannot be used with --script".to_string());
+    }
+    if daemon.is_some() && no_window_system {
+        return Err("neomacs: daemon mode cannot be used with -nw/--no-window-system".to_string());
+    }
+    if daemon.is_some() && frontend == FrontendKind::Tty {
+        return Err("neomacs: daemon mode cannot be used with a TTY".to_string());
+    }
+
     Ok(StartupOptions {
         frontend,
         forwarded_args,
+        raw_args,
         terminal_device,
         noninteractive,
+        daemon,
         temacs_mode,
         dump_file_override,
         no_site_lisp,
@@ -1571,18 +1680,18 @@ impl DisplayHost for PrimaryWindowDisplayHost {
     }
 
     fn destroy_gui_frame(&mut self, frame_id: neovm_core::window::FrameId) -> Result<(), String> {
-        let frame = if self.primary_frame_id == Some(frame_id) {
+        let was_primary = self.primary_frame_id == Some(frame_id);
+        if was_primary {
             self.primary_frame_id = None;
-            FrameRef::Primary
-        } else {
-            FrameRef::Frame(frame_id.0)
-        };
+        }
         self.last_window_titles
             .lock()
             .map_err(|err| format!("failed to forget GUI frame title: {err}"))?
             .remove(&frame_id);
         self.send_render_command(
-            RenderCommand::Window(WindowCommand::DestroyWindow { frame }),
+            RenderCommand::Window(WindowCommand::DestroyWindow {
+                frame: FrameRef::Frame(frame_id.0),
+            }),
             "failed to destroy GUI frame window",
         )
     }
@@ -3001,6 +3110,11 @@ fn run_gui_main_thread(
     height: u32,
     bootstrap_display: BootstrapDisplayConfig,
 ) {
+    let render_startup_mode = if startup.daemon.is_some() {
+        RenderStartupMode::DeferredPrimary
+    } else {
+        RenderStartupMode::ImmediatePrimary
+    };
     let render_waker = GuiEventLoopWaker::new(event_loop.create_proxy());
 
     let comms = ThreadComms::new();
@@ -3045,6 +3159,7 @@ fn run_gui_main_thread(
                 Arc::clone(&gui_image_metadata),
                 Arc::clone(&shared_monitors),
                 shared_terminals,
+                render_startup_mode,
             )
         }
         #[cfg(not(feature = "neo-term"))]
@@ -3057,6 +3172,7 @@ fn run_gui_main_thread(
                 "Neomacs".to_string(),
                 Arc::clone(&gui_image_metadata),
                 Arc::clone(&shared_monitors),
+                render_startup_mode,
             )
         }
     };
@@ -3254,7 +3370,11 @@ fn run_gui_evaluator_worker(
         cmd_tx: emacs_comms.cmd_tx.clone(),
         render_waker: Some(render_waker.clone()),
         font_sizing: bootstrap_display.font_sizing(),
-        primary_window_adopted: false,
+        // Normal GUI startup adopts the renderer's bootstrap primary. A
+        // daemon has no bootstrap window, so its first GUI frame is sent as a
+        // normal create request and becomes the deferred primary on the
+        // render thread.
+        primary_window_adopted: startup.daemon.is_some(),
         primary_frame_id: None,
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
@@ -3272,8 +3392,10 @@ fn run_gui_evaluator_worker(
         #[cfg(feature = "neo-term")]
         terminal_state: TerminalHostState::new(shared_terminals),
     }));
-    adopt_existing_primary_gui_frame(&mut evaluator)
-        .expect("bootstrap GUI frame adoption should succeed");
+    if startup.daemon.is_none() {
+        adopt_existing_primary_gui_frame(&mut evaluator)
+            .expect("bootstrap GUI frame adoption should succeed");
+    }
 
     prime_initial_monitor_snapshot(&shared_monitors);
 
@@ -3355,7 +3477,9 @@ fn run_gui_evaluator_worker(
     }));
     frame_layout::install_frame_snapshot_fn(&mut evaluator);
     frame_layout::install_window_layout_query_fn(&mut evaluator);
-    publish_gui_frame(&mut evaluator, &initial_frame_tx, Some(&render_waker));
+    if startup.daemon.is_none() {
+        publish_gui_frame(&mut evaluator, &initial_frame_tx, Some(&render_waker));
+    }
 
     if let Some(buf) = evaluator.buffer_manager_mut().current_buffer_mut() {
         let mut ul = buf.get_undo_list();
@@ -3681,11 +3805,32 @@ pub fn run(mode: RuntimeMode) {
     // any tracing output would smash the alt-screen redisplay engine).
     // `parse_startup_options` emits no tracing events, so delaying init
     // past it costs no diagnostics.
-    let startup = parse_startup_options(std::env::args()).unwrap_or_else(|message| {
+    let mut startup = parse_startup_options(std::env::args()).unwrap_or_else(|message| {
         eprintln!("{message}");
         std::process::exit(1);
     });
-
+    #[cfg(windows)]
+    if mode == RuntimeMode::FinalRun {
+        let _ = configure_server_socket_directory();
+    }
+    // Keep the original OS argument vector for a background-daemon re-exec.
+    // The parser above intentionally sorts and consumes native options, but
+    // the child must receive every original token in its original order.
+    startup.raw_args = process_args.clone();
+    let startup = match daemon::prepare(startup) {
+        Ok(daemon::DaemonLaunch::Continue(startup)) => startup,
+        Ok(daemon::DaemonLaunch::ParentExit(code)) => std::process::exit(code),
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = neovm_core::emacs_core::daemon::configure(startup.daemon.clone())
+        .map_err(|error| format!("neomacs: {error}"))
+    {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     // Initialize tracing with a writer target appropriate to the
     // binary:
     //
@@ -3710,7 +3855,12 @@ pub fn run(mode: RuntimeMode) {
     // stdout).
     let console_logging_requested =
         std::env::var_os("RUST_LOG").is_some_and(|value| !value.is_empty());
-    let log_target = log_target_for(mode, startup.frontend, console_logging_requested);
+    let log_target = log_target_for(
+        mode,
+        startup.frontend,
+        console_logging_requested,
+        startup.daemon.is_some(),
+    );
     let _logging_guard = neovm_core::logging::init(log_target);
 
     if mode == RuntimeMode::Raw
@@ -4665,31 +4815,43 @@ fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &
             Value::T
         },
     );
-    let (terminal_frame, frame_initial_frame, default_minibuffer_frame) = match startup.frontend {
-        FrontendKind::Gui => {
-            let terminal_frame_id = ensure_gnu_startup_terminal_frame(eval, frame_id);
-            let window_system = Value::symbol(gui_window_system_symbol());
-            eval.set_variable("window-system", window_system);
-            eval.set_variable("initial-window-system", window_system);
-            eval.set_variable(
-                "frame-initial-frame-alist",
-                opening_frame_initial_alist(eval, window_system),
-            );
-            (
-                Value::make_frame(terminal_frame_id.0),
-                Value::make_frame(frame_id.0),
-                Value::make_frame(frame_id.0),
-            )
-        }
-        FrontendKind::Tty => {
+    let (terminal_frame, frame_initial_frame, default_minibuffer_frame) =
+        if startup.daemon.is_some() {
+            let terminal_frame_id = configure_daemon_startup_frame(eval, frame_id);
             eval.set_variable("window-system", Value::NIL);
             eval.set_variable("initial-window-system", Value::NIL);
-            if tty_init::should_enable_live_tty_io(startup) {
-                seed_live_tty_frame_parameters(eval, frame_id, startup);
+            (
+                Value::make_frame(terminal_frame_id.0),
+                Value::NIL,
+                Value::NIL,
+            )
+        } else {
+            match startup.frontend {
+                FrontendKind::Gui => {
+                    let terminal_frame_id = ensure_gnu_startup_terminal_frame(eval, frame_id);
+                    let window_system = Value::symbol(gui_window_system_symbol());
+                    eval.set_variable("window-system", window_system);
+                    eval.set_variable("initial-window-system", window_system);
+                    eval.set_variable(
+                        "frame-initial-frame-alist",
+                        opening_frame_initial_alist(eval, window_system),
+                    );
+                    (
+                        Value::make_frame(terminal_frame_id.0),
+                        Value::make_frame(frame_id.0),
+                        Value::make_frame(frame_id.0),
+                    )
+                }
+                FrontendKind::Tty => {
+                    eval.set_variable("window-system", Value::NIL);
+                    eval.set_variable("initial-window-system", Value::NIL);
+                    if tty_init::should_enable_live_tty_io(startup) {
+                        seed_live_tty_frame_parameters(eval, frame_id, startup);
+                    }
+                    (Value::make_frame(frame_id.0), Value::NIL, Value::NIL)
+                }
             }
-            (Value::make_frame(frame_id.0), Value::NIL, Value::NIL)
-        }
-    };
+        };
     eval.set_variable("invocation-name", Value::string(invocation_name));
     eval.set_variable(
         "invocation-directory",
@@ -4751,6 +4913,15 @@ fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &
     // with_mirrored_evaluator.  Users who want it can set this to nil in
     // their init file.
     eval.set_variable("inhibit-startup-screen", Value::T);
+}
+
+fn configure_daemon_startup_frame(eval: &mut Context, frame_id: FrameId) -> FrameId {
+    if let Some(frame) = eval.frame_manager_mut().get_mut(frame_id) {
+        frame.visible = true;
+        frame.set_window_system(None);
+        frame.set_display_identity(FrameDisplayIdentity::default());
+    }
+    frame_id
 }
 
 fn seed_live_tty_frame_parameters(eval: &mut Context, frame_id: FrameId, startup: &StartupOptions) {
@@ -4869,6 +5040,7 @@ fn opening_frame_initial_alist(eval: &Context, window_system: Value) -> Value {
 
 #[cfg(test)]
 fn run_gnu_startup(eval: &mut Context) {
+    let _daemon_test_lock = tests::daemon_test_lock();
     increase_stack_limit();
     stacker::grow(64 * 1024 * 1024, || run_gnu_startup_inner(eval));
 }

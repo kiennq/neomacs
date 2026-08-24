@@ -189,6 +189,23 @@ fn idx_threading_walks_argv_one_match_at_a_time() {
 // ---------- sort_args ----------
 
 #[test]
+fn daemon_option_rows_match_gnu_priority_table() {
+    for (name, longname) in [
+        ("-daemon", "--daemon"),
+        ("-bg-daemon", "--bg-daemon"),
+        ("-fg-daemon", "--fg-daemon"),
+    ] {
+        let row = STANDARD_ARGS
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("missing standard arg row for {name}"));
+        assert_eq!(row.longname, Some(longname));
+        assert_eq!(row.priority, 99);
+        assert_eq!(row.nargs, 0);
+    }
+}
+
+#[test]
 fn sort_args_keeps_program_name_at_index_zero() {
     // GNU emacs.c:2895 — `new[0] = argv[0];` always.
     let mut argv = args(&["neomacs"]);
