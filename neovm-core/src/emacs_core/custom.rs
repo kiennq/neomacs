@@ -725,24 +725,7 @@ pub(crate) fn builtin_set_default(eval: &mut super::eval::Context, args: Vec<Val
     // `buffer_defaults` AND propagates to every live buffer whose
     // local_flags bit is clear. Mirrors GNU `set_default_internal`
     // SYMBOL_FORWARDED arm (`data.c:2044-2078`).
-    let forwarded_slot = {
-        use crate::emacs_core::forward::{LispBufferObjFwd, LispFwdType};
-        use crate::emacs_core::symbol::SymbolRedirect;
-        eval.obarray()
-            .get_by_id(resolved)
-            .filter(|sym| sym.redirect() == SymbolRedirect::Forwarded)
-            .and_then(|sym| {
-                let fwd = unsafe { &*sym.val.fwd };
-                if matches!(fwd.ty, LispFwdType::BufferObj) {
-                    let buf_fwd = unsafe { &*(fwd as *const _ as *const LispBufferObjFwd) };
-                    let info_name = crate::emacs_core::intern::resolve_sym(resolved);
-                    crate::buffer::buffer::lookup_buffer_slot(info_name)
-                        .map(|info| (info, buf_fwd.offset))
-                } else {
-                    None
-                }
-            })
-    };
+    let forwarded_slot = forwarded_buffer_slot_info(eval, resolved);
     // GNU `set_default_internal` calls `notify_variable_watchers` before the
     // value cell is changed, so callbacks observe the previous value through
     // `symbol-value`.
@@ -750,7 +733,7 @@ pub(crate) fn builtin_set_default(eval: &mut super::eval::Context, args: Vec<Val
     if resolved != symbol {
         eval.run_variable_watchers_by_id(resolved, &value, &Value::NIL, "set")?;
     }
-    if let Some((info, _off)) = forwarded_slot {
+    if let Some(info) = forwarded_slot {
         eval.buffers.set_buffer_default_slot(info, value);
     } else {
         eval.obarray_mut().set_symbol_value_id(resolved, value);
@@ -767,6 +750,24 @@ pub(crate) fn builtin_set_default(eval: &mut super::eval::Context, args: Vec<Val
     eval.mark_redisplay_dirty_if_display_var(resolved);
 
     Ok(value)
+}
+
+pub(crate) fn forwarded_buffer_slot_info(
+    eval: &super::eval::Context,
+    resolved: SymId,
+) -> Option<&'static crate::buffer::buffer::BufferSlotInfo> {
+    use crate::emacs_core::forward::LispFwdType;
+    use crate::emacs_core::symbol::SymbolRedirect;
+
+    eval.obarray()
+        .get_by_id(resolved)
+        .filter(|sym| sym.redirect() == SymbolRedirect::Forwarded)
+        .and_then(|sym| {
+            let fwd = unsafe { &*sym.val.fwd };
+            matches!(fwd.ty, LispFwdType::BufferObj)
+                .then(|| crate::buffer::buffer::lookup_buffer_slot(resolve_sym(resolved)))
+                .flatten()
+        })
 }
 
 // ---------------------------------------------------------------------------
