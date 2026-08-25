@@ -661,6 +661,35 @@ fn set_default_toplevel_alias_triggers_variable_watchers_twice() {
     assert_eq!(results[5], "OK 2");
 }
 
+#[test]
+fn set_default_toplevel_updates_forwarded_buffer_defaults() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    let current = eval.buffers.current_buffer_id().expect("current buffer");
+    let other = eval.buffers.create_buffer("*other*");
+    let custom = Value::list(vec![Value::string("CUSTOM")]);
+
+    crate::emacs_core::builtins::symbols::builtin_set_default_toplevel_value(
+        &mut eval,
+        vec![Value::symbol("mode-line-format"), custom],
+    )
+    .expect("set-default-toplevel-value");
+
+    assert_eq!(
+        builtin_default_value(&mut eval, vec![Value::symbol("mode-line-format")])
+            .expect("default-value"),
+        custom
+    );
+    for buffer_id in [current, other] {
+        assert_eq!(
+            eval.buffers
+                .get(buffer_id)
+                .and_then(|buffer| buffer.buffer_local_value("mode-line-format")),
+            Some(custom)
+        );
+    }
+}
+
 // -- make-variable-buffer-local builtin --------------------------------
 
 #[test]

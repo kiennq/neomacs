@@ -426,8 +426,12 @@ pub(crate) fn set_default_toplevel_value_impl(
         resolved,
         value,
     ) {
-        ctx.obarray.set_symbol_value_id(resolved, value);
-        ctx.sync_cached_runtime_binding_by_id(resolved, value);
+        if let Some(info) = crate::emacs_core::custom::forwarded_buffer_slot_info(ctx, resolved) {
+            ctx.buffers.set_buffer_default_slot(info, value);
+        } else {
+            ctx.obarray.set_symbol_value_id(resolved, value);
+            ctx.sync_cached_runtime_binding_by_id(resolved, value);
+        }
     }
     ctx.refresh_gc_runtime_settings_after_change_by_id(resolved);
     // Finding 6: `set-default-toplevel-value` (the `setq-default` /
