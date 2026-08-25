@@ -1480,7 +1480,6 @@ pub(crate) fn builtin_font_shape_gstring(args: Vec<Value>) -> EvalResult {
             vec![Value::string("Invalid glyph-string: ")],
         ));
     }
-    let _ = expect_fixnum(&args[1])?;
     Ok(Value::NIL)
 }
 

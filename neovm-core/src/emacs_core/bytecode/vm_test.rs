@@ -7625,7 +7625,7 @@ fn vm_font_stub_tail_uses_direct_dispatch() {
                  (null (font-has-char-p (font-spec :family "Mono") ?a))
                  (null (font-info "Mono"))
                  (null (font-match-p (font-spec) (font-spec)))
-                 (null (font-shape-gstring [0] 0))
+                 (null (font-shape-gstring [0] nil))
                  (condition-case nil
                      (font-variation-glyphs nil ?a)
                    (wrong-type-argument t))

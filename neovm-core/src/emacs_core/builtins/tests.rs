@@ -6498,7 +6498,7 @@ fn pure_dispatch_position_placeholders_match_compat_contracts() {
 }
 
 #[test]
-fn pure_dispatch_record_query_placeholders_match_compat_contracts() {
+fn pure_dispatch_record_placeholders_match_compat_contracts() {
     crate::test_utils::init_test_tracing();
     let record = dispatch_builtin_pure("record", vec![Value::symbol("tag"), Value::fixnum(1)])
         .expect("builtin record should resolve")
@@ -6520,11 +6520,6 @@ fn pure_dispatch_record_query_placeholders_match_compat_contracts() {
         .expect("builtin recordp should resolve")
         .expect("builtin recordp should evaluate");
     assert!(recordp.is_nil());
-
-    let query_font = dispatch_builtin_pure("query-font", vec![Value::NIL])
-        .expect("builtin query-font should resolve")
-        .expect("builtin query-font should evaluate");
-    assert!(query_font.is_nil());
 
     super::symbols::reset_symbols_thread_locals();
     let query_fontset =

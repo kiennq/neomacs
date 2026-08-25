@@ -5825,12 +5825,7 @@ pub(crate) fn init_builtins(ctx: &mut super::eval::Context) {
         3,
         Some(3),
     );
-    ctx.defsubr(
-        "query-font",
-        |_ctx, args| builtin_query_font(args),
-        1,
-        Some(1),
-    );
+    ctx.defsubr("query-font", super::font::builtin_query_font, 1, Some(1));
     ctx.defsubr(
         "query-fontset",
         |_ctx, args| builtin_query_fontset(args),

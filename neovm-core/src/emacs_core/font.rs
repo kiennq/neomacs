@@ -3279,6 +3279,36 @@ pub(crate) fn builtin_font_info(eval: &mut super::eval::Context, args: Vec<Value
     }
 }
 
+pub(crate) fn builtin_query_font(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+    expect_args("query-font", &args, 1)?;
+    if !is_font_object(&args[0]) {
+        return Err(signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("font-object"), args[0]],
+        ));
+    }
+
+    let info = if let Some(info) = font_info_vector_for_entity(eval, &args[0]) {
+        info
+    } else {
+        let capability = font_value_otf_capability(eval, &args[0]);
+        let frame_id = super::window_cmds::ensure_selected_frame_id(eval);
+        let frame = eval
+            .frames
+            .get(frame_id)
+            .ok_or_else(|| signal("error", vec![Value::string("No selected frame")]))?;
+        font_info_vector_for_runtime_font(&args[0], frame, capability)
+    };
+    let values = info
+        .as_vector_data()
+        .filter(|values| values.len() >= 14)
+        .ok_or_else(|| signal("error", vec![Value::string("Invalid font-info result")]))?;
+    Ok(Value::vector(vec![
+        values[0], values[12], values[2], values[7], values[8], values[9], values[10], values[11],
+        values[13],
+    ]))
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
