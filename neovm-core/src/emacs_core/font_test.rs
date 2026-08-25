@@ -1,8 +1,8 @@
 use super::*;
 use crate::buffer::{Buffer, CharPos0};
 use crate::emacs_core::eval::{
-    Context, DisplayHost, FontResolveRequest, FontSpecResolveRequest, GuiFrameHostRequest,
-    ResolvedFontMatch, ResolvedFontSpecMatch,
+    Context, DisplayHost, FontOtfCapability, FontPxProbeResult, FontResolveRequest,
+    FontSpecResolveRequest, GuiFrameHostRequest, ResolvedFontMatch, ResolvedFontSpecMatch,
 };
 use crate::emacs_core::value::ValueKind;
 use crate::emacs_core::xfaces::*;
@@ -221,6 +221,8 @@ fn gnu_font_style_tables_are_constant_symbols() {
 #[derive(Default)]
 struct FontAtDisplayHost {
     matched: Option<ResolvedFontMatch>,
+    metrics: Option<FontPxProbeResult>,
+    capability: Option<FontOtfCapability>,
 }
 
 impl DisplayHost for FontAtDisplayHost {
@@ -241,6 +243,24 @@ impl DisplayHost for FontAtDisplayHost {
         } else {
             Ok(None)
         }
+    }
+
+    fn probe_font_px_metrics(
+        &mut self,
+        _file: &str,
+        _face_index: u32,
+        _pixel_size: u32,
+        _wght: Option<f32>,
+    ) -> Result<Option<FontPxProbeResult>, String> {
+        Ok(self.metrics)
+    }
+
+    fn font_otf_capability(
+        &mut self,
+        _file: &str,
+        _face_index: u32,
+    ) -> Result<Option<FontOtfCapability>, String> {
+        Ok(self.capability.clone())
     }
 }
 
@@ -932,6 +952,7 @@ fn font_at_eval_prefers_backend_selected_font_match_when_available() {
             postscript_name: Some(LispString::from_utf8("NotoSansMonoCJKsc-Regular")),
             glyph_code: Some(0x2A),
         }),
+        ..Default::default()
     }));
 
     let buffer = eval
@@ -994,6 +1015,7 @@ fn internal_char_font_returns_font_object_and_glyph_code() {
             postscript_name: Some(LispString::from_utf8("NotoSansMonoCJKsc-Regular")),
             glyph_code: Some(0x2A),
         }),
+        ..Default::default()
     }));
     let buffer = eval
         .buffers
@@ -1045,6 +1067,83 @@ fn font_info_eval_accepts_font_object_on_live_gui_frame() {
     assert_eq!(values[3].as_int(), Some(18));
     assert_eq!(values[10].as_int(), Some(9));
     assert_eq!(values[11].as_int(), Some(9));
+}
+
+#[test]
+fn query_font_eval_returns_metrics_with_terminal_frame_selected() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::Context::new();
+    let frame_id = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
+    {
+        let frame = eval
+            .frame_manager_mut()
+            .get_mut(frame_id)
+            .expect("selected frame");
+        frame.window_system = Some(Value::symbol("neo"));
+        frame.font_pixel_size = 18.0;
+        frame.char_width = 9.0;
+        frame.char_height = 18.0;
+    }
+    eval.set_display_host(Box::new(FontAtDisplayHost {
+        matched: Some(ResolvedFontMatch {
+            pixel_size_px: 17,
+            family: LispString::from_utf8("Noto Sans Mono CJK SC"),
+            foundry: None,
+            file: Some(LispString::from_utf8("/tmp/NotoSansMonoCJKsc-Regular.otf")),
+            weight: FontWeight::NORMAL,
+            slant: FontSlant::Normal,
+            width: FontWidth::Normal,
+            postscript_name: Some(LispString::from_utf8("NotoSansMonoCJKsc-Regular")),
+            glyph_code: Some(0x2A),
+        }),
+        metrics: Some(FontPxProbeResult {
+            pixel_size: 17,
+            height: 18,
+            ascent: 13,
+            descent: 5,
+            max_width: 19,
+            space_width: 11,
+            average_width: 12,
+        }),
+        capability: Some(FontOtfCapability {
+            gsub: vec![("latn".to_owned(), vec![(None, vec!["liga".to_owned()])])],
+            gpos: Vec::new(),
+        }),
+    }));
+    eval.buffers
+        .current_buffer_mut()
+        .expect("current buffer")
+        .insert("a好b");
+
+    let font = builtin_font_at(&mut eval, vec![Value::fixnum(2)]).unwrap();
+    eval.frame_manager_mut()
+        .get_mut(frame_id)
+        .expect("selected frame")
+        .window_system = None;
+    let query = builtin_query_font(&mut eval, vec![font]).unwrap();
+    let values = query.as_vector_data().expect("query-font vector");
+
+    assert_eq!(values.len(), 9);
+    assert!(
+        values[0]
+            .as_utf8_str()
+            .is_some_and(|name| name.contains("-17-"))
+    );
+    assert_eq!(
+        values[1].as_utf8_str(),
+        Some("/tmp/NotoSansMonoCJKsc-Regular.otf")
+    );
+    for (index, expected) in [(2, 17), (3, 19), (4, 13), (5, 5), (6, 11), (7, 12)] {
+        assert_eq!(values[index].as_int(), Some(expected), "slot {index}");
+    }
+    assert_eq!(values[8].cons_car().as_symbol_name(), Some("opentype"));
+    assert!(values[8].cons_cdr().cons_car().is_cons());
+
+    let err = builtin_query_font(&mut eval, vec![Value::NIL]).unwrap_err();
+    match err {
+        Flow::Signal(sig) => assert_eq!(sig.data, vec![Value::symbol("font-object"), Value::NIL]),
+        other => panic!("expected wrong-type-argument, got {other:?}"),
+    }
 }
 
 #[test]

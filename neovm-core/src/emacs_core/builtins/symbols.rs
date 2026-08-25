@@ -2848,11 +2848,6 @@ pub(crate) fn builtin_recordp_1(_eval: &mut super::eval::Context, arg: Value) ->
     Ok(Value::bool_val(arg.is_record()))
 }
 
-pub(crate) fn builtin_query_font(args: Vec<Value>) -> EvalResult {
-    expect_args("query-font", &args, 1)?;
-    Ok(Value::NIL)
-}
-
 pub(crate) fn builtin_query_fontset(args: Vec<Value>) -> EvalResult {
     expect_args_range("query-fontset", &args, 1, 2)?;
     let pattern = expect_string_lossy(&args[0])?;
