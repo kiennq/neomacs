@@ -42,6 +42,23 @@ pub(crate) struct CompileStats {
     pub histogram_us: [u64; 8],
 }
 
+/// Process-global native-cache counters. The coordinator owns the instance
+/// under its `RwLock`; this plain-data type intentionally contains no loader
+/// handles or other thread-affine state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeCacheCounters {
+    pub indexed_leaves: u64,
+    pub indexed_generations: u64,
+    pub loaded_leaves: u64,
+    pub loaded_generations: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub validation_failures: u64,
+    pub emitted_leaves: u64,
+    pub skipped_leaves: u64,
+    pub bytes: u64,
+}
+
 thread_local! {
     static STATS: Cell<CompileStats> = Cell::new(CompileStats::default());
 }

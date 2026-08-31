@@ -592,11 +592,6 @@ pub(crate) struct AotSpecSite {
 /// callee_reloc_idx:4). Fixed so the loader can bound + slice the spec-section.
 const SPEC_SITE_BYTES: usize = 1 + 1 + 2 + 4;
 
-/// Max `Op::Call` spec sites a single leaf may carry — bounds a crafted/corrupt
-/// `spec_count` before it drives a huge allocation/over-read. Real leaves have a
-/// handful; the operand stack is a u16 so no honest body approaches this.
-const MAX_SPEC_SITES: u32 = 64 * 1024;
-
 /// The decoded descriptor: leaf metadata + the reloc rebuild recipe bytes.
 pub(crate) struct AotDescriptor {
     pub meta: super::compile::AotLeafMeta,
@@ -650,6 +645,9 @@ pub(crate) fn encode_descriptor(
 /// Parse a descriptor blob. Returns `None` on a bad magic/version/ABI_TAG or a
 /// truncated blob — the loader then refuses the artifact and falls back to JIT.
 pub(crate) fn decode_descriptor(bytes: &[u8]) -> Option<AotDescriptor> {
+    if bytes.len() > super::native_cache::MAX_DESCRIPTOR_BYTES as usize {
+        return None;
+    }
     fn rd_u32(b: &[u8], at: &mut usize) -> Option<u32> {
         let v = b.get(*at..*at + 4)?;
         *at += 4;
@@ -686,10 +684,13 @@ pub(crate) fn decode_descriptor(bytes: &[u8]) -> Option<AotDescriptor> {
     let reloc_count = rd_u32(bytes, &mut at)?;
     // v2: spec_count sits right before recipe_len.
     let spec_count = rd_u32(bytes, &mut at)?;
-    if spec_count > MAX_SPEC_SITES {
+    if spec_count > super::native_cache::MAX_SPEC_SITES {
         return None; // crafted/corrupt count — fail closed.
     }
     let recipe_len = rd_u64(bytes, &mut at)? as usize;
+    if recipe_len > super::native_cache::MAX_RELOC_RECIPE_BYTES as usize {
+        return None;
+    }
     // checked_add (audit minor): recipe_len is untrusted; match the file's
     // all-checked-slicing invariant so a crafted blob fails closed (None), never
     // debug-panics on overflow, even for a future direct caller of this fn.
@@ -3786,9 +3787,7 @@ pub(crate) fn load_leaf_from_unit(
     // and the blob gained a spec-section (`spec_count` × SPEC_SITE_BYTES) AFTER the
     // recipe — so HDR is 4 larger (=57) and `total` includes the spec-section.
     const HDR: usize = 4 + 4 + 4 + 8 + 8 + 5 + 8 + 4 + 4 + 8; // encode_descriptor v2 (=57)
-    // A generous cap: a leaf's reloc recipe is tiny in practice. Rejects an absurd
-    // length before it drives a huge over-read.
-    const MAX_RECIPE_LEN: usize = 1 << 20; // 1 MiB
+    // Bound the untrusted recipe before it drives a huge over-read.
     // SAFETY: symbols we exported; the entry's ABI is the CompiledLeaf entry ABI.
     let (entry_ptr, desc_bytes): (*const u8, Vec<u8>) = unsafe {
         let lib = unit.library();
@@ -3809,15 +3808,18 @@ pub(crate) fn load_leaf_from_unit(
         // 3) spec_count + recipe_len: bound BOTH, then checked-add the total size
         //    (fixed header + recipe + spec-section). spec_count is at HDR-12..HDR-8.
         let spec_count = u32::from_le_bytes(hdr[HDR - 12..HDR - 8].try_into().ok()?);
-        if spec_count > MAX_SPEC_SITES {
+        if spec_count > super::native_cache::MAX_SPEC_SITES {
             return None;
         }
         let recipe_len = u64::from_le_bytes(hdr[HDR - 8..HDR].try_into().ok()?) as usize;
-        if recipe_len > MAX_RECIPE_LEN {
+        if recipe_len > super::native_cache::MAX_RELOC_RECIPE_BYTES as usize {
             return None;
         }
         let spec_bytes = (spec_count as usize).checked_mul(SPEC_SITE_BYTES)?;
         let total = HDR.checked_add(recipe_len)?.checked_add(spec_bytes)?;
+        if total > super::native_cache::MAX_DESCRIPTOR_BYTES as usize {
+            return None;
+        }
         let all = std::slice::from_raw_parts(desc_ptr, total).to_vec();
         (entry_ptr, all)
     };
