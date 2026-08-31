@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 // `emacs_core/runtime/jit/shim_names.rs` below.
 #[path = "build_support/generated_lisp.rs"]
 mod generated_lisp;
+#[path = "build_support/native_cache.rs"]
+mod native_cache;
 
 // Single source of truth (R2-C2): the `neovm_jit_*` shim names, shared with
 // runtime/jit/aot.rs (MIR_SHIM_NAMES) + crates/neomacs/build.rs via `include!` so the
@@ -39,6 +41,7 @@ fn main() {
         std::env::var("TARGET").expect("cargo sets TARGET for build scripts")
     );
 
+    native_cache::emit_native_cache_build_metadata();
     detect_lcms2();
     detect_wkwebview();
     ensure_generated_unicode_lisp(&project_root);
