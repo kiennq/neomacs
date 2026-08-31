@@ -719,7 +719,14 @@ pub fn try_run_compiled(
     func_value: Value,
     args: &[Value],
 ) -> Result<Option<usize>, Flow> {
-    let id = func.jit_runtime().compiled_id_or_assign();
+    let runtime = func.jit_runtime();
+    let id = runtime.compiled_id_or_assign();
+    let native_cache_prewarm =
+        runtime.is_aot_prewarmed() && super::aot::prewarm_hash_for(id).is_none();
+    if native_cache_prewarm && runtime.patched_prefix() != 0 {
+        runtime.clear_aot_prewarmed();
+        return Ok(None);
+    }
     if id > max_compiled_id() {
         return Ok(None);
     }
@@ -745,6 +752,43 @@ pub fn try_run_compiled(
             );
         }
     }
+    // A prekey match opts this one call into the AOT path. Keep it outside
+    // `get_or_insert_with`: a stale/malformed native-cache entry must clear
+    // only the marker and return to the interpreter, never create a positive
+    // or negative compiled-cache entry and never pay an early JIT compile.
+    // The legacy dump-time preload uses the same dispatch marker and keeps a
+    // verified hash in `aot::PREWARM_HASHES`; leave that path on its existing
+    // additive AOT-then-JIT behavior. Native-cache publication/pdump markers
+    // have no preload hash and take the strict stale-safe path below.
+    if native_cache_prewarm {
+        let Some(obarray) = (!ctx.is_null()).then(|| unsafe { &(*ctx).obarray }) else {
+            runtime.clear_aot_prewarmed();
+            return Ok(None);
+        };
+        match super::native_cache::try_load_prewarmed(func, obarray) {
+            super::native_cache::NativeCacheLookup::Hit(leaf) => {
+                runtime.clear_aot_prewarmed();
+                let leaf = COMPILED.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    evict_stale_inline_leaf(&mut cache, id, Some(obarray));
+                    match cache.get_or_insert_with(id, || CacheEntry::Compiled(Rc::clone(&leaf))) {
+                        CacheEntry::Compiled(leaf) if leaf.accepts(args.len()) => {
+                            Some(Rc::clone(leaf))
+                        }
+                        _ => None,
+                    }
+                });
+                return match leaf {
+                    Some(leaf) => run_resolved_leaf(ctx, func, func_value, &leaf, args),
+                    None => Ok(None),
+                };
+            }
+            super::native_cache::NativeCacheLookup::Miss => {
+                runtime.clear_aot_prewarmed();
+                return Ok(None);
+            }
+        }
+    }
     let leaf: Option<Rc<CompiledLeaf>> = COMPILED.with(|cache| {
         let mut cache = cache.borrow_mut();
         // SAFETY: the seam-provided Context is dormant for the whole native
@@ -755,15 +799,7 @@ pub fn try_run_compiled(
         // Re-JIT a STALE INLINED leaf: if it inlined a callee and the obarray's
         // function_epoch has since moved, a callee it inlined may have been
         // redefined — drop the entry so it recompiles below (no stale inline runs).
-        let stale = matches!(
-            cache.get(id),
-            Some(CacheEntry::Compiled(l))
-                if l.inline_epoch().is_some()
-                    && l.inline_epoch() != obarray.map(|ob| ob.function_epoch())
-        );
-        if stale {
-            cache.remove(id);
-        }
+        evict_stale_inline_leaf(&mut cache, id, obarray);
         match cache.get_or_insert_with(id, || {
             // R1c-6: consult AOT FIRST (additive — a miss/error falls through to
             // the JIT below, leaving JIT behavior unchanged). An AOT hit is a
@@ -805,6 +841,18 @@ pub fn try_run_compiled(
     match leaf {
         None => Ok(None),
         Some(leaf) => run_resolved_leaf(ctx, func, func_value, &leaf, args),
+    }
+}
+
+fn evict_stale_inline_leaf(cache: &mut DenseCache, id: u64, obarray: Option<&Obarray>) {
+    let stale = matches!(
+        cache.get(id),
+        Some(CacheEntry::Compiled(l))
+            if l.inline_epoch().is_some()
+                && l.inline_epoch() != obarray.map(|ob| ob.function_epoch())
+    );
+    if stale {
+        cache.remove(id);
     }
 }
 
@@ -1138,6 +1186,7 @@ fn finish_native_run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{aot, compile, native_cache};
     use super::*;
     use crate::emacs_core::bytecode::opcode::Op;
     use crate::emacs_core::value::{LambdaParams, Value};
@@ -1277,6 +1326,108 @@ mod tests {
         assert_eq!(a, a_again, "id is stable per function");
         assert_ne!(a, b, "distinct functions get distinct ids");
         assert_ne!(a, 0, "0 is reserved for unassigned");
+    }
+
+    #[test]
+    fn prewarm_hit_evicts_stale_inlined_leaf_before_reuse() {
+        use crate::emacs_core::eval::Context;
+        use crate::emacs_core::intern::SymId;
+
+        let _lock = native_cache::test_lock();
+        native_cache::reset_for_test();
+        clear();
+
+        let mut ev = Context::new();
+        let c_sym = Value::symbol("prewarm-stale-inline-c");
+        let c_id = crate::emacs_core::intern::intern("prewarm-stale-inline-c");
+        let mut c = ByteCodeFunction::new(LambdaParams {
+            required: vec![SymId(1)],
+            optional: Vec::new(),
+            rest: None,
+        });
+        c.lexical = true;
+        c.ops = vec![Op::Dup, Op::Mul, Op::Return];
+        c.max_stack = 16;
+        ev.obarray
+            .set_symbol_function_id(c_id, Value::make_bytecode(c));
+
+        let mut f = ByteCodeFunction::new(LambdaParams {
+            required: vec![SymId(2)],
+            optional: Vec::new(),
+            rest: None,
+        });
+        f.lexical = true;
+        f.ops = vec![Op::Constant(0), Op::StackRef(1), Op::Call(1), Op::Return];
+        f.constants = vec![c_sym].into();
+        f.max_stack = 16;
+        let old_leaf = Rc::new(
+            compile::compile_bytecode_function_with(&f, Some(&ev.obarray))
+                .expect("caller must compile"),
+        );
+        assert!(
+            old_leaf.inline_epoch().is_some(),
+            "fixture must contain an inlined callee"
+        );
+        let id = f.jit_runtime().compiled_id_or_assign();
+        COMPILED.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(id, CacheEntry::Compiled(Rc::clone(&old_leaf)));
+        });
+        ev.obarray.bump_function_epoch();
+
+        let mut replacement = ByteCodeFunction::new(LambdaParams {
+            required: vec![SymId(2)],
+            optional: Vec::new(),
+            rest: None,
+        });
+        replacement.lexical = true;
+        replacement.ops = vec![Op::StackRef(0), Op::Return];
+        replacement.max_stack = 16;
+        let replacement = Rc::new(
+            compile::compile_bytecode_function_with(&replacement, Some(&ev.obarray))
+                .expect("replacement must compile"),
+        );
+        let content =
+            aot::leaf_content_hash(f.executable_ops(), &f.constants, f.params.required.len())
+                .expect("fixture body must hash");
+        native_cache::install_index(native_cache::GenerationIndex {
+            generations: vec![native_cache::IndexedGeneration {
+                generation_id: native_cache::GenerationId(1),
+                created_unix_secs: 1,
+                leaves: vec![native_cache::IndexedLeaf {
+                    generation_id: native_cache::GenerationId(1),
+                    created_unix_secs: 1,
+                    prekey: native_cache::FunctionPrekey::new("f", 1, f.ops.len()),
+                    content_hash: native_cache::ContentHash(content),
+                    variant_hash: native_cache::VariantHash(0),
+                    arity: 1,
+                    entry_symbol: "entry".into(),
+                    descriptor_symbol: "descriptor".into(),
+                    descriptor_bytes: 0,
+                    reloc_recipe_bytes: 0,
+                    spec_site_count: 0,
+                }],
+            }],
+        });
+        native_cache::install_lookup_for_test(move |_, _, _| {
+            native_cache::NativeCacheLookup::Hit(Rc::clone(&replacement))
+        });
+        f.jit_runtime().mark_aot_prewarmed();
+
+        let result = try_run_compiled(
+            &mut ev as *mut Context,
+            &f,
+            Value::NIL,
+            &[Value::make_int(5)],
+        )
+        .expect("prewarmed replacement must run")
+        .expect("replacement must return");
+        assert_eq!(Value::from_bits(result), Value::make_int(5));
+        assert!(is_compiled_for_test(id));
+
+        native_cache::reset_for_test();
+        clear();
     }
 
     #[test]

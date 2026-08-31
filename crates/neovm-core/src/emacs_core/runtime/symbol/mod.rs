@@ -3259,6 +3259,8 @@ impl Obarray {
         store_value_atomic(&mut sym.function, function);
         sym.function_unbound = false;
         self.note_function_redefined(id);
+        #[cfg(feature = "jit")]
+        crate::emacs_core::jit::native_cache::on_function_published(self, id, function);
     }
 
     /// Record that function-call behavior changed WITHOUT a cell write — the
@@ -3305,6 +3307,8 @@ impl Obarray {
         store_value_atomic(&mut sym.function, function);
         sym.function_unbound = false;
         self.note_function_redefined(id);
+        #[cfg(feature = "jit")]
+        crate::emacs_core::jit::native_cache::on_function_published(self, id, function);
     }
 
     /// Remove the function cell (fmakunbound).

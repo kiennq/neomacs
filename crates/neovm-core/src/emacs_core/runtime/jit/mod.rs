@@ -103,6 +103,10 @@ pub mod mir;
 #[cfg(feature = "jit")]
 pub mod aot;
 
+/// Persistent native-cache configuration, manifest index, and status model.
+#[cfg(feature = "jit")]
+pub mod native_cache;
+
 /// Always-on metering of the synchronous compile stalls the cache-miss path
 /// pays on the eval thread — the evidence base for background compilation.
 /// Only built with the `jit` feature. See `jit/stats.rs`.
@@ -654,9 +658,28 @@ impl RuntimeState {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Clear the one-shot AOT prewarm marker after a lookup has either loaded
+    /// the leaf or proved the indexed entry stale.
+    #[inline]
+    pub(crate) fn clear_aot_prewarmed(&self) {
+        self.aot_prewarmed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the next compiled dispatch must perform the one-shot AOT lookup.
+    #[inline]
+    pub(crate) fn is_aot_prewarmed(&self) -> bool {
+        self.aot_prewarmed.load(Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_hot_for_test(&self) {
         self.heat.store(Self::HOT_THRESHOLD, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_heat_for_test(&self, heat: u32) {
+        self.heat.store(heat, Ordering::Relaxed);
     }
 
     /// Test-only: pin this function to the Tier-0 interpreter forever (the
