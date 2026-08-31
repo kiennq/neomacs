@@ -187,6 +187,170 @@ fn eval_one_with_subr(src: &str) -> String {
     eval_all_with_subr(src).into_iter().next().expect("result")
 }
 
+#[cfg(feature = "jit")]
+#[test]
+fn failed_aot_prewarm_does_not_insert_or_lower_the_jit_threshold() {
+    crate::test_utils::init_test_tracing();
+    use crate::emacs_core::bytecode::ByteCodeFunction;
+    use crate::emacs_core::bytecode::opcode::Op;
+    use crate::emacs_core::intern::intern;
+    use crate::emacs_core::jit::{Plan, hot_threshold, native_cache};
+    use crate::emacs_core::value::LambdaParams;
+
+    let _lock = native_cache::test_lock();
+    let mut ev = Context::new();
+    let sym = intern("failed-aot-prewarm");
+    let mut func = ByteCodeFunction::new(LambdaParams {
+        required: vec![intern("arg")],
+        optional: Vec::new(),
+        rest: None,
+    });
+    func.lexical = true;
+    func.ops = vec![Op::StackRef(0), Op::Return];
+    func.max_stack = 4;
+    let function = Value::make_bytecode(func.clone());
+
+    native_cache::reset_for_test();
+    native_cache::install_index(native_cache::GenerationIndex {
+        generations: vec![native_cache::IndexedGeneration {
+            generation_id: native_cache::GenerationId(1),
+            created_unix_secs: 1,
+            leaves: vec![native_cache::IndexedLeaf {
+                generation_id: native_cache::GenerationId(1),
+                created_unix_secs: 1,
+                prekey: native_cache::FunctionPrekey::new("failed-aot-prewarm", 1, 2),
+                content_hash: native_cache::ContentHash(0xdead),
+                variant_hash: native_cache::VariantHash(0),
+                arity: 1,
+                entry_symbol: "entry".into(),
+                descriptor_symbol: "descriptor".into(),
+                descriptor_bytes: 0,
+                reloc_recipe_bytes: 0,
+                spec_site_count: 0,
+            }],
+        }],
+    });
+    native_cache::install_lookup_for_test(|_, _, _| native_cache::NativeCacheLookup::Miss);
+
+    ev.obarray.set_symbol_function_id(sym, function);
+    assert!(func.jit_runtime().is_aot_prewarmed());
+    let threshold = hot_threshold();
+    // The marker dispatch itself still counts as one invocation; after the
+    // stale lookup clears it, nine ordinary calls must remain below the
+    // unchanged threshold.
+    func.jit_runtime()
+        .set_heat_for_test(threshold.saturating_sub(11));
+    assert!(matches!(
+        func.jit_runtime().dispatch_sized(func.ops.len()),
+        Plan::Compiled
+    ));
+    let id = func.jit_runtime().compiled_id_or_assign();
+    assert_eq!(
+        crate::emacs_core::jit::try_run_compiled(
+            &mut ev as *mut Context,
+            &func,
+            Value::NIL,
+            &[Value::make_int(7)],
+        )
+        .expect("stale prewarm falls back cleanly"),
+        None
+    );
+    assert!(!func.jit_runtime().is_aot_prewarmed());
+    assert!(!crate::emacs_core::jit::cache::is_compiled_for_test(id));
+
+    for _ in 0..9 {
+        assert!(matches!(
+            func.jit_runtime().dispatch_sized(func.ops.len()),
+            Plan::Interpret
+        ));
+    }
+    assert!(matches!(
+        func.jit_runtime().dispatch_sized(func.ops.len()),
+        Plan::Compiled
+    ));
+    native_cache::reset_for_test();
+    crate::emacs_core::jit::cache::clear();
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn successful_aot_prewarm_hits_and_executes_on_call_one() {
+    crate::test_utils::init_test_tracing();
+    use crate::emacs_core::bytecode::ByteCodeFunction;
+    use crate::emacs_core::bytecode::opcode::Op;
+    use crate::emacs_core::intern::intern;
+    use crate::emacs_core::jit::{Plan, hot_threshold, native_cache};
+    use crate::emacs_core::value::LambdaParams;
+
+    let _lock = native_cache::test_lock();
+    let mut ev = Context::new();
+    let sym = intern("successful-aot-prewarm");
+    let mut func = ByteCodeFunction::new(LambdaParams {
+        required: vec![intern("arg")],
+        optional: Vec::new(),
+        rest: None,
+    });
+    func.lexical = true;
+    func.ops = vec![Op::StackRef(0), Op::Return];
+    func.max_stack = 4;
+    let function = Value::make_bytecode(func.clone());
+    let leaf = Rc::new(
+        crate::emacs_core::jit::compile::compile_bytecode_function_with(&func, Some(ev.obarray()))
+            .expect("test leaf compiles"),
+    );
+    let content = crate::emacs_core::jit::aot::leaf_content_hash(
+        &func.ops,
+        &func.constants,
+        func.params.required.len(),
+    )
+    .expect("test body has a canonical content hash");
+
+    native_cache::reset_for_test();
+    native_cache::install_index(native_cache::GenerationIndex {
+        generations: vec![native_cache::IndexedGeneration {
+            generation_id: native_cache::GenerationId(1),
+            created_unix_secs: 1,
+            leaves: vec![native_cache::IndexedLeaf {
+                generation_id: native_cache::GenerationId(1),
+                created_unix_secs: 1,
+                prekey: native_cache::FunctionPrekey::new("successful-aot-prewarm", 1, 2),
+                content_hash: native_cache::ContentHash(content),
+                variant_hash: native_cache::VariantHash(0),
+                arity: 1,
+                entry_symbol: "entry".into(),
+                descriptor_symbol: "descriptor".into(),
+                descriptor_bytes: 0,
+                reloc_recipe_bytes: 0,
+                spec_site_count: 0,
+            }],
+        }],
+    });
+    native_cache::install_lookup_for_test(move |_, _, _| {
+        native_cache::NativeCacheLookup::Hit(Rc::clone(&leaf))
+    });
+
+    ev.obarray.set_symbol_function_id(sym, function);
+    assert!(func.jit_runtime().is_aot_prewarmed());
+    assert_eq!(func.jit_runtime().heat(), 0);
+    assert!(matches!(
+        func.jit_runtime().dispatch_sized(func.ops.len()),
+        Plan::Compiled
+    ));
+    assert!(func.jit_runtime().heat() < hot_threshold());
+    let result = crate::emacs_core::jit::try_run_compiled(
+        &mut ev as *mut Context,
+        &func,
+        Value::NIL,
+        &[Value::make_int(42)],
+    )
+    .expect("prewarmed leaf runs")
+    .expect("prewarmed leaf returns a value");
+    assert_eq!(Value::from_bits(result), Value::make_int(42));
+    assert_eq!(native_cache::status().hits, 1);
+    native_cache::reset_for_test();
+    crate::emacs_core::jit::cache::clear();
+}
+
 fn bootstrap_eval_all(src: &str) -> Vec<String> {
     runtime_startup_eval_all(src)
 }

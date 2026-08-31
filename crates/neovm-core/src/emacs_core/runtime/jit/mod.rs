@@ -68,7 +68,7 @@
 #![cfg_attr(not(feature = "jit"), allow(dead_code))]
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::emacs_core::intern::SymId;
 
@@ -106,6 +106,10 @@ pub mod mir;
 /// `CompiledLeaf`. Only built with the `jit` feature. See `jit/aot.rs`.
 #[cfg(feature = "jit")]
 pub mod aot;
+
+/// Persistent native-cache configuration, manifest index, and status model.
+#[cfg(feature = "jit")]
+pub mod native_cache;
 
 /// Always-on metering of the synchronous compile stalls the cache-miss path
 /// pays on the eval thread — the evidence base for background compilation.
@@ -292,13 +296,9 @@ pub struct RuntimeState {
     /// stale cache entry can never be mis-looked-up after the (non-moving) GC
     /// reuses its address — a new function gets a new id. Reset to 0 on clone.
     compiled_id: AtomicU64,
-    /// Set by the AOT preload prepopulate (R2-C3) when this function's leaf was
-    /// inserted into the compiled cache at startup: `dispatch` then serves the
-    /// prewarmed native leaf FROM CALL 1 instead of interpreting until the heat
-    /// threshold — the piece that lets the AOT preload cover ONE-SHOT startup
-    /// elisp, which never gets hot. One relaxed load on the dispatch path,
-    /// never set in the default (AOT-off) configuration.
-    aot_prewarmed: std::sync::atomic::AtomicBool,
+    /// Prewarm source: 0 = none, 1 = legacy preload AOT, 2 = persistent native
+    /// cache. Both serve from call 1; only the native-cache marker is one-shot.
+    aot_prewarmed: AtomicU8,
     /// Widest `make-closure` patch seen for this source: the number of leading
     /// constant slots that hold PER-INSTANCE captured values (the prototype
     /// carries placeholder symbols `V0..Vn` there — `byte-compile-make-closure`).
@@ -319,6 +319,10 @@ pub struct RuntimeState {
     #[cfg(test)]
     force_interpret: std::sync::atomic::AtomicBool,
 }
+
+const PREWARM_NONE: u8 = 0;
+const PREWARM_LEGACY_AOT: u8 = 1;
+const PREWARM_NATIVE_CACHE: u8 = 2;
 
 /// Source of process-unique [`Runtime::compiled_id`] values. Ids are
 /// `fetch_add + 1` so 0 stays reserved for "unassigned".
@@ -569,7 +573,7 @@ impl RuntimeState {
             profit_deferred_heat: AtomicU32::new(0),
             feedback: FeedbackVec::new(),
             compiled_id: AtomicU64::new(0),
-            aot_prewarmed: std::sync::atomic::AtomicBool::new(false),
+            aot_prewarmed: AtomicU8::new(PREWARM_NONE),
             patched_prefix: AtomicU32::new(0),
             #[cfg(test)]
             force_interpret: std::sync::atomic::AtomicBool::new(false),
@@ -731,7 +735,7 @@ impl RuntimeState {
         let prev = self.heat.load(Ordering::Relaxed);
         let now = prev.saturating_add(1);
         self.heat.store(now, Ordering::Relaxed);
-        if self.aot_prewarmed.load(Ordering::Relaxed) {
+        if self.is_aot_prewarmed() {
             return Plan::Compiled;
         }
         if self.native_rejected() || self.tier_up_deferred(now) {
@@ -779,7 +783,7 @@ impl RuntimeState {
         let prev = self.heat.load(Ordering::Relaxed);
         let now = prev.saturating_add(1);
         self.heat.store(now, Ordering::Relaxed);
-        if self.aot_prewarmed.load(Ordering::Relaxed) {
+        if self.is_aot_prewarmed() {
             Plan::Compiled
         } else if self.native_rejected() || self.tier_up_deferred(now) {
             Plan::Interpret
@@ -877,7 +881,42 @@ impl RuntimeState {
     /// field doc): `dispatch` returns `Plan::Compiled` from call 1.
     pub(crate) fn mark_aot_prewarmed(&self) {
         self.aot_prewarmed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(PREWARM_LEGACY_AOT, Ordering::Relaxed);
+    }
+
+    /// Mark a persistent native-cache candidate without replacing a legacy AOT
+    /// preload marker, which carries its manifest hash separately.
+    pub(crate) fn mark_native_cache_prewarmed(&self) {
+        let _ = self.aot_prewarmed.compare_exchange(
+            PREWARM_NONE,
+            PREWARM_NATIVE_CACHE,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Clear the one-shot native-cache marker after lookup.
+    #[inline]
+    pub(crate) fn clear_native_cache_prewarmed(&self) {
+        let _ = self.aot_prewarmed.compare_exchange(
+            PREWARM_NATIVE_CACHE,
+            PREWARM_NONE,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Whether native dispatch is prewarmed from either cache.
+    #[inline]
+    pub(crate) fn is_aot_prewarmed(&self) -> bool {
+        self.aot_prewarmed.load(Ordering::Relaxed) != PREWARM_NONE
+    }
+
+    /// Whether the next compiled dispatch must perform the one-shot persistent
+    /// native-cache lookup.
+    #[inline]
+    pub(crate) fn is_native_cache_prewarmed(&self) -> bool {
+        self.aot_prewarmed.load(Ordering::Relaxed) == PREWARM_NATIVE_CACHE
     }
 
     #[cfg(test)]
@@ -890,7 +929,6 @@ impl RuntimeState {
     pub(crate) fn set_heat_for_test(&self, heat: u32) {
         self.heat.store(heat, Ordering::Relaxed);
     }
-
     /// Test-only: pin this function to the Tier-0 interpreter forever (the
     /// forced-cold half of the benchmark A/B; see `force_interpret`).
     #[cfg(test)]
@@ -1146,6 +1184,23 @@ mod tests {
         rt.mark_native_rejected(super::cache::rejection_epoch());
         rt.mark_aot_prewarmed();
         assert!(matches!(rt.dispatch(), Plan::Compiled));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn native_cache_prewarm_is_distinct_from_legacy_aot_prewarm() {
+        let legacy = Runtime::new();
+        legacy.mark_aot_prewarmed();
+        assert!(legacy.is_aot_prewarmed());
+        assert!(!legacy.is_native_cache_prewarmed());
+
+        let native_cache = Runtime::new();
+        native_cache.mark_native_cache_prewarmed();
+        assert!(native_cache.is_aot_prewarmed());
+        assert!(native_cache.is_native_cache_prewarmed());
+        native_cache.clear_native_cache_prewarmed();
+        assert!(!native_cache.is_aot_prewarmed());
+        assert!(!native_cache.is_native_cache_prewarmed());
     }
 
     /// A profitability deferral holds the dispatcher at `Interpret` (no cache
