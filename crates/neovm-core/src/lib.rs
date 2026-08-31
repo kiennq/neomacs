@@ -13,6 +13,7 @@ pub mod keyboard;
 mod keyboard_input;
 pub mod local_socket;
 pub mod logging;
+pub mod private_directory;
 pub mod tagged;
 #[cfg(test)]
 pub mod test_utils;

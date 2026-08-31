@@ -44,6 +44,7 @@ libloading.workspace = true
 tree-sitter.workspace = true
 tree-sitter-language.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 bytemuck.workspace = true
 memmap2.workspace = true
 tempfile.workspace = true
@@ -134,6 +135,7 @@ tree-sitter-json = "0.24"
 syn = { version = "3.0.3", features = ["full", "visit"] }
 
 [build-dependencies]
+object = "0.37"
 pkg-config.workspace = true
 sha2.workspace = true
 

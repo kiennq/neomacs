@@ -2157,3 +2157,135 @@ fn baked_stub_template_is_stack_state_independent() {
          an uninitialized byte is reaching the baked image"
     );
 }
+
+#[cfg(feature = "jit")]
+#[test]
+fn native_cache_publication_and_prewarm_do_not_materialize_ineligible_lazy_pdump_stubs() {
+    crate::test_utils::init_test_tracing();
+    let _lock = crate::emacs_core::jit::native_cache::test_lock();
+    crate::emacs_core::jit::native_cache::reset_for_test();
+
+    let optional_name = "pdump-native-cache-optional";
+    let required_only_name = "pdump-native-cache-required-only-absent";
+    let mut eval = Context::new();
+    let mut optional_function = ByteCodeFunction::new(LambdaParams {
+        required: vec![intern("pdump-native-cache-required")],
+        optional: vec![intern("pdump-native-cache-optional-arg")],
+        rest: None,
+    });
+    optional_function.ops = vec![Op::Return];
+    optional_function.max_stack = 1;
+    optional_function.gnu_bytecode_bytes =
+        Some(crate::tagged::header::LispByteVec::owned(vec![0x87]));
+    eval.obarray
+        .set_symbol_value(optional_name, Value::make_bytecode(optional_function));
+
+    let mut required_only_function = ByteCodeFunction::new(LambdaParams::simple(vec![intern(
+        "pdump-native-cache-required-only-arg",
+    )]));
+    required_only_function.ops = vec![Op::Return];
+    required_only_function.max_stack = 1;
+    required_only_function.gnu_bytecode_bytes =
+        Some(crate::tagged::header::LispByteVec::owned(vec![0x87]));
+    eval.obarray.set_symbol_value(
+        required_only_name,
+        Value::make_bytecode(required_only_function),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let dump_path = dir.path().join("native-cache-lazy.pdump");
+    dump_to_file(&eval, &dump_path).expect("dump should succeed");
+    let mut loaded = load_from_dump(&dump_path).expect("load should succeed");
+
+    let optional_function = *loaded
+        .obarray
+        .symbol_value(optional_name)
+        .expect("optional bytecode value should be restored");
+    let required_only_function = *loaded
+        .obarray
+        .symbol_value(required_only_name)
+        .expect("required-only bytecode value should be restored");
+    for function in [optional_function, required_only_function] {
+        assert!(loaded.tagged_heap.mapped_image_owns_for_test(function));
+        assert!(
+            function.bytecode_data_if_materialized().is_none(),
+            "image-resident stubs must start unmaterialized"
+        );
+    }
+    assert_eq!(
+        optional_function.bytecode_params_required_only_probe(),
+        Some(false),
+        "the optional-argument image-resident stub must be ineligible without materializing"
+    );
+    assert_eq!(
+        required_only_function.bytecode_params_required_only_probe(),
+        Some(true),
+        "the required-only image-resident stub must be eligible without materializing"
+    );
+    // The normal publication path intentionally probes through the
+    // materializing accessor. Bypass it only to place these real
+    // image-resident stubs in the function cells that prewarm scans.
+    for (name, function) in [
+        (optional_name, optional_function),
+        (required_only_name, required_only_function),
+    ] {
+        loaded
+            .obarray
+            .get_mut(name)
+            .expect("target symbol should be restored")
+            .function = function;
+    }
+
+    crate::emacs_core::jit::native_cache::install_index(
+        crate::emacs_core::jit::native_cache::GenerationIndex {
+            generations: vec![crate::emacs_core::jit::native_cache::IndexedGeneration {
+                generation_id: crate::emacs_core::jit::native_cache::GenerationId(1),
+                created_unix_secs: 1,
+                leaves: vec![crate::emacs_core::jit::native_cache::IndexedLeaf {
+                    generation_id: crate::emacs_core::jit::native_cache::GenerationId(1),
+                    created_unix_secs: 1,
+                    prekey: crate::emacs_core::jit::native_cache::FunctionPrekey::new(
+                        optional_name,
+                        1,
+                        1,
+                    ),
+                    content_hash: crate::emacs_core::jit::native_cache::ContentHash(1),
+                    variant_hash: crate::emacs_core::jit::native_cache::VariantHash(0),
+                    arity: 1,
+                    entry_symbol: "entry".into(),
+                    descriptor_symbol: "descriptor".into(),
+                    descriptor_bytes: 0,
+                    reloc_recipe_bytes: 0,
+                    spec_site_count: 0,
+                }],
+            }],
+        },
+    );
+
+    crate::emacs_core::jit::native_cache::on_function_published(
+        &loaded.obarray,
+        intern(required_only_name),
+        required_only_function,
+    );
+    assert!(
+        required_only_function
+            .bytecode_data_if_materialized()
+            .is_none(),
+        "publishing a pdump stub absent from the prekey map must not materialize it"
+    );
+
+    let report = crate::emacs_core::jit::native_cache::prewarm_after_pdump(&loaded);
+    assert_eq!(report.candidates, 0);
+    assert_eq!(report.marked, 0);
+    assert!(
+        optional_function.bytecode_data_if_materialized().is_none(),
+        "prewarm must not materialize an optional-argument pdump stub"
+    );
+    assert!(
+        required_only_function
+            .bytecode_data_if_materialized()
+            .is_none(),
+        "prewarm must not materialize a required-only pdump stub absent from the native-cache prekey map"
+    );
+    crate::emacs_core::jit::native_cache::reset_for_test();
+}
