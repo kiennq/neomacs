@@ -40,6 +40,14 @@ fn assert_test_assets_action(job: &str, runtime: bool, archive: bool) {
     assert!(!job.contains("*download_workspace_test_archive"));
 }
 
+fn assert_gnu_reference_action(job: &str, enabled: bool) {
+    if enabled {
+        assert!(job.contains("gnu-reference: \"true\""));
+    } else {
+        assert!(!job.contains("gnu-reference:"));
+    }
+}
+
 #[test]
 fn top_level_dispatch_routes_perf_without_parsing_fresh_build_options() {
     run_xtask(
@@ -330,6 +338,109 @@ fn release_workflow_windows_uploads_only_the_portable_zip() {
     assert!(!job.contains("Package .exe installer"));
     assert!(!job.contains("Verify Windows installer ownership contract"));
     assert!(!job.contains("dist/*.exe"));
+}
+
+#[test]
+fn gnu_reference_workflow_builds_and_publishes_the_pinned_asset() {
+    let workflow = include_str!(concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/.github/workflows/gnu-reference.yml"
+    ))
+    .replace("\r\n", "\n");
+
+    assert!(workflow.contains("push:"));
+    assert!(workflow.contains("tags:"));
+    assert!(workflow.contains("gnu-reference-0ee48ac4df2"));
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(!workflow.contains("branches:"));
+    assert!(workflow.contains("permissions:\n      contents: write"));
+    assert!(workflow.contains("runs-on: ubuntu-24.04"));
+    assert!(workflow.contains("scripts/ci/build-gnu-reference.sh"));
+    assert!(workflow.contains("GH_TOKEN: ${{ github.token }}"));
+    assert!(workflow.contains("gh release create"));
+    assert!(workflow.contains("--target \"$GITHUB_SHA\""));
+    assert!(workflow.contains("--verify-tag"));
+    assert!(workflow.contains("refs/tags/$release_tag"));
+    assert!(workflow.contains("gh release upload"));
+    assert!(workflow.contains("gnu-emacs-31.0.90-linux-x86_64.tar.zst"));
+    assert!(workflow.contains("readonly checksum=\"${asset}.sha256\""));
+    assert!(workflow.contains("libncurses-dev"));
+    assert!(workflow.contains("fontconfig"));
+    assert!(workflow.contains("fonts-noto-core"));
+    assert!(workflow.contains("gh release view"));
+    assert!(workflow.contains("--json assets"));
+    assert!(workflow.contains("existing_assets"));
+    assert!(workflow.contains("refusing to replace immutable release asset"));
+    assert!(!workflow.contains("--clobber"));
+    assert!(!workflow.contains("softprops/action-gh-release"));
+    assert!(!workflow.contains("actions/upload-artifact@"));
+}
+
+#[test]
+fn gnu_reference_builder_contract_is_source_pinned_and_self_validating() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("scripts/ci/build-gnu-reference.sh"),
+    )
+    .expect("GNU reference builder");
+
+    for required in [
+        "parity-reference.toml",
+        "mirror_commit",
+        "https://github.com/emacs-mirror/emacs.git",
+        "git clone",
+        "checkout --detach",
+        "--without-native-compilation",
+        "--with-x-toolkit=gtk3",
+        "--with-json",
+        "--with-tree-sitter",
+        "--with-sqlite3",
+        "--without-mailutils",
+        "make -j",
+        "strip --strip-unneeded",
+        "src/emacs",
+        "src/emacs.pdmp",
+        "lisp",
+        "etc",
+        "lib-src",
+        "info",
+        "--batch",
+        "xvfb-run",
+        "tar --zstd",
+        "tar --zstd -xf",
+        "mktemp -d",
+        "EMACSDATA",
+        "EMACSDOC",
+        "EMACSPATH",
+        "EMACSLOADPATH",
+        "data-directory",
+        "doc-directory",
+        "locate-library",
+        "timeout --signal=TERM 60s",
+        "gnu-emacs-31.0.90-linux-x86_64.tar.zst",
+        "sha256sum",
+    ] {
+        assert!(script.contains(required), "builder is missing {required}");
+    }
+}
+
+#[test]
+fn pin_reference_requires_a_gnu_mirror_origin_before_auto_detection() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("crates/xtask/src/pin_reference.rs"),
+    )
+    .expect("pin-reference implementation");
+    let origin = source
+        .find("remote.origin.url")
+        .expect("automatic detection must inspect remote.origin.url");
+    let head = source
+        .find("rev-parse")
+        .expect("automatic detection must resolve HEAD");
+    assert!(
+        origin < head,
+        "the checkout origin must be validated before accepting git HEAD"
+    );
+    assert!(source.contains("is_emacs_mirror_url"));
+    assert!(source.contains("--mirror-commit SHA"));
 }
 
 #[test]
@@ -841,6 +952,9 @@ fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
     );
     assert!(!build.lines().any(|package| package == "emacs-nox"));
 
+    let display = packages("display");
+    assert!(display.lines().any(|package| package == "fontconfig"));
+
     let no_gstreamer = packages("build-no-gstreamer");
     assert!(
         no_gstreamer
@@ -854,14 +968,31 @@ fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
     );
 
     let oracle = packages("oracle");
-    for package in ["liblcms2-dev", "emacs-nox", "libfaketime"] {
+    for package in [
+        "liblcms2-dev",
+        "libfaketime",
+        "libgtk-3-0t64",
+        "libjansson4",
+        "libharfbuzz0b",
+        "libtree-sitter0",
+        "libsqlite3-0",
+        "libgnutls30t64",
+        "libpng16-16t64",
+    ] {
         assert!(oracle.lines().any(|candidate| candidate == package));
     }
+    assert!(!oracle.lines().any(|package| package == "emacs-nox"));
 
     let ecosystem = packages("ecosystem");
     for package in [
-        "emacs-nox",
         "gnupg",
+        "libgtk-3-0t64",
+        "libjansson4",
+        "libharfbuzz0b",
+        "libtree-sitter0",
+        "libsqlite3-0",
+        "libgnutls30t64",
+        "libpng16-16t64",
         "xvfb",
         "xauth",
         "x11-utils",
@@ -871,6 +1002,30 @@ fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
     ] {
         assert!(ecosystem.lines().any(|candidate| candidate == package));
     }
+    assert!(!ecosystem.lines().any(|package| package == "emacs-nox"));
+
+    let script = fs::read_to_string(&script).expect("Linux CI setup script");
+    let nerd_font_url = "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/JetBrainsMono/Ligatures/Regular/JetBrainsMonoNerdFont-Regular.ttf";
+    assert!(script.contains(nerd_font_url));
+    assert!(script.contains("0ec29a68b539ece7078fc714cebff0c0accb2f4948f8f7963d9f5e86633b12d9"));
+    assert!(script.contains("/usr/local/share/fonts/neomacs"));
+    assert!(script.contains("fc-cache"));
+    assert!(script.contains("JetBrainsMono Nerd Font:charset=f48a"));
+    assert!(script.contains("display)\n        requires_nerd_font=true"));
+    assert_eq!(script.matches("requires_nerd_font=true").count(), 2);
+    assert!(script.contains("if $requires_nerd_font; then"));
+    assert!(!build.contains(nerd_font_url));
+    assert!(!oracle.contains(nerd_font_url));
+    assert!(script.contains("NEOMACS_MELPA_ORACLE_EMACS"));
+    assert!(script.contains("--batch --quick"));
+    assert!(!script.contains("emacs --batch --quick"));
+    assert!(script.contains("oracle)"));
+    assert!(script.contains("requires_emacs=false"));
+    assert!(script.contains("requires_emacs=true"));
+    for variable in ["EMACSDATA", "EMACSDOC", "EMACSPATH", "EMACSLOADPATH"] {
+        assert!(script.contains(variable));
+    }
+    assert!(script.contains("if [[ -z ${NEOMACS_MELPA_ORACLE_EMACS:-} ]]"));
 
     let release = packages("release");
     for package in ["rpm", "binutils", "cpio", "file"] {
@@ -884,6 +1039,20 @@ fn linux_ci_setup_profiles_expose_capabilities_and_reject_unknown_profiles() {
         .expect("reject unknown Linux CI profile");
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown profile: typo"));
+}
+
+#[test]
+fn melpa_preflight_scopes_uninstalled_gnu_paths_to_the_gnu_probe() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("scripts/melpa-infra-preflight.sh"),
+    )
+    .expect("MELPA infrastructure preflight script");
+
+    assert!(script.contains("if [[ $label == gnu-emacs"));
+    for variable in ["EMACSDATA", "EMACSDOC", "EMACSPATH", "EMACSLOADPATH"] {
+        assert!(script.contains(variable));
+    }
+    assert!(script.contains("\"${runtime_environment[@]}\""));
 }
 
 #[test]
@@ -1161,7 +1330,10 @@ fn github_actions_exposes_only_ci_sync_and_release_workflows() {
         .collect::<Vec<_>>();
     active.sort();
 
-    assert_eq!(active, ["ci.yml", "release.yml", "sync.yml"]);
+    assert_eq!(
+        active,
+        ["ci.yml", "gnu-reference.yml", "release.yml", "sync.yml"]
+    );
 }
 
 #[test]
@@ -1207,7 +1379,8 @@ fn ci_builds_one_shared_linux_release_test_artifact_producer() {
         2,
         "both shared artifacts must use the current upload-artifact pin"
     );
-    assert!(!producer.contains("CARGO_PROFILE_RELEASE_"));
+    assert!(producer.contains("CARGO_PROFILE_RELEASE_LTO: \"false\""));
+    assert!(producer.contains("CARGO_PROFILE_RELEASE_CODEGEN_UNITS: \"1\""));
     assert!(!producer.contains("RUSTFLAGS:"));
 }
 
@@ -1278,6 +1451,10 @@ fn ci_producer_scopes_cargo_build_jobs_to_archive_step() {
     let archive_start = producer
         .find("\n      - name: Archive workspace tests\n")
         .expect("producer must define the workspace archive step");
+    assert!(
+        !producer[..archive_start].contains("CARGO_PROFILE_RELEASE_"),
+        "archive-only release overrides must not affect the shipped runtime build"
+    );
     let archive_tail = &producer[archive_start..];
     let archive_end = archive_tail[1..]
         .find("\n      - name:")
@@ -1291,6 +1468,14 @@ fn ci_producer_scopes_cargo_build_jobs_to_archive_step() {
     assert!(
         compact_archive.contains("env: CARGO_BUILD_JOBS: \"1\""),
         "workspace archive step must serialize linking on the hosted runner"
+    );
+    assert!(
+        compact_archive.contains("CARGO_PROFILE_RELEASE_LTO: \"false\""),
+        "workspace archive step must disable LTO without changing the global release profile"
+    );
+    assert!(
+        compact_archive.contains("CARGO_PROFILE_RELEASE_CODEGEN_UNITS: \"1\""),
+        "workspace archive step must use one codegen unit without changing the global release profile"
     );
 }
 
@@ -1509,6 +1694,7 @@ fn ci_inlines_one_typed_sharded_nextest_matrix_for_core_oracle_and_tui() {
     assert!(shards.contains("if: matrix.suite == 'oracle'"));
     assert!(shards.contains("--partition slice:${{ matrix.partition }}/20"));
     assert_test_assets_action(shards, true, true);
+    assert!(shards.contains("gnu-reference: ${{ matrix.suite == 'tui' && 'true' || 'false' }}"));
     assert!(
         !workflow.contains("uses: ./.github/workflows/"),
         "the three active workflows must not call a server-invisible disabled workflow"
@@ -1557,8 +1743,11 @@ fn ci_runs_offline_melpa_parity_from_shared_artifacts() {
     assert!(job.contains("needs: neomacs-test-artifacts"));
     assert!(!job.contains("if: ${{ false }}"));
     assert_test_assets_action(job, true, true);
+    assert_gnu_reference_action(job, true);
     assert!(job.contains("NEOMACS_BIN: ${{ github.workspace }}/target/release/neomacs"));
-    assert!(job.contains("NEOMACS_MELPA_ORACLE_EMACS: /usr/bin/emacs"));
+    assert!(!job.contains("NEOMACS_MELPA_ORACLE_EMACS:"));
+    assert!(!job.contains("NEOMACS_GUI_TEST_GNU_EMACS:"));
+    assert!(!job.contains("/usr/bin/emacs"));
     assert!(job.contains("run: scripts/ci/setup-linux.sh ecosystem"));
     for suite in ["batch", "tui", "gui"] {
         assert!(job.contains(&format!("suite: {suite}")));
@@ -1584,6 +1773,8 @@ fn ci_executes_display_stack_and_real_gui_tests_from_shared_artifacts() {
 
     let display = github_workflow_job(workflow, "neomacs-display-tests");
     assert!(display.contains("needs: neomacs-test-artifacts"));
+    assert!(display.contains("run: scripts/ci/setup-linux.sh display"));
+    assert!(!display.contains("run: scripts/ci/setup-linux.sh build"));
     assert_test_assets_action(display, false, true);
     for package in [
         "neomacs-display-protocol",
@@ -1598,8 +1789,9 @@ fn ci_executes_display_stack_and_real_gui_tests_from_shared_artifacts() {
 
     let gui = github_workflow_job(workflow, "neomacs-gui-tests");
     assert_test_assets_action(gui, true, true);
+    assert_gnu_reference_action(gui, true);
     assert!(gui.contains("NEOMACS_GUI_TEST_BACKEND: x11"));
-    assert!(gui.contains("NEOMACS_GUI_TEST_GNU_EMACS: /usr/bin/emacs"));
+    assert!(!gui.contains("NEOMACS_GUI_TEST_GNU_EMACS:"));
     assert!(gui.contains("package(neomacs-gui-tests)"));
 }
 
@@ -1616,6 +1808,9 @@ fn ci_runs_live_melpa_only_as_an_explicit_canary() {
     assert!(job.contains("github.event_name == 'schedule'"));
     assert!(job.contains("github.event_name == 'workflow_dispatch'"));
     assert_test_assets_action(job, true, true);
+    assert_gnu_reference_action(job, true);
+    assert!(!job.contains("NEOMACS_MELPA_ORACLE_EMACS:"));
+    assert!(!job.contains("/usr/bin/emacs"));
     assert!(job.contains("--run-ignored only"));
     assert!(job.contains("test(=live_melpa_ecosystem_installs_and_survives_restart)"));
     assert!(job.contains("--success-output immediate"));
@@ -1631,13 +1826,13 @@ fn ci_uses_one_shared_test_artifact_producer_and_download_action() {
     assert!(shards.contains("needs: neomacs-test-artifacts"));
     assert_test_assets_action(shards, true, true);
 
-    for (job_name, runtime, archive) in [
-        ("neomacs-melpa-tests", true, true),
-        ("neomacs-display-tests", false, true),
-        ("neomacs-prefix-face-tui-parity", true, true),
-        ("neomacs-gui-tests", true, true),
-        ("neomacs-melpa-live-canary", true, true),
-        ("doom-install-compatibility", true, false),
+    for (job_name, runtime, archive, gnu_reference) in [
+        ("neomacs-melpa-tests", true, true, true),
+        ("neomacs-display-tests", false, true, false),
+        ("neomacs-prefix-face-tui-parity", true, true, true),
+        ("neomacs-gui-tests", true, true, true),
+        ("neomacs-melpa-live-canary", true, true, true),
+        ("doom-install-compatibility", true, false, false),
     ] {
         let job = github_workflow_job(workflow, job_name);
         assert!(
@@ -1645,7 +1840,10 @@ fn ci_uses_one_shared_test_artifact_producer_and_download_action() {
             "{job_name} must depend on the shared producer"
         );
         assert_test_assets_action(job, runtime, archive);
+        assert_gnu_reference_action(job, gnu_reference);
     }
+
+    assert!(!workflow.contains("/usr/bin/emacs"));
 
     for legacy in [
         "\n  neomacs-workspace-test-archive:\n",
@@ -1683,10 +1881,96 @@ fn shared_test_asset_action_declares_runtime_and_archive_inputs() {
         assert!(action.contains(&format!("{input}:\n")));
         assert!(action.contains("default: \"false\""));
     }
+    assert!(action.contains("gnu-reference:"));
+    assert!(action.contains("gnu-reference:\n"));
+    assert!(action.contains("https://github.com/kiennq/neomacs/releases/download/gnu-reference-0ee48ac4df2/gnu-emacs-31.0.90-linux-x86_64.tar.zst"));
+    assert!(action.contains("gnu-emacs-31.0.90-linux-x86_64.tar.zst.sha256"));
+    assert!(action.contains(
+        "curl --fail --location --retry 3 --retry-all-errors --retry-connrefused --show-error"
+    ));
+    assert!(action.contains("sha256sum -c"));
+    assert!(action.contains("tar --zstd"));
+    assert!(action.contains("GITHUB_WORKSPACE/gnu-reference"));
+    assert!(action.contains("gnu_reference_root/src/emacs"));
+    assert!(action.contains("gnu_reference_root/src/emacs.pdmp"));
+    assert!(action.contains("for directory in lisp etc lib-src info"));
+    assert!(action.contains("scripts/parity-reference-attest.sh"));
+    assert!(action.contains("exhaustive"));
+    assert!(action.contains("gnu_reference_root/src"));
+    assert!(action.contains("GITHUB_PATH"));
+    for variable in ["EMACSDATA", "EMACSDOC", "EMACSPATH", "EMACSLOADPATH"] {
+        assert!(
+            !action.contains(variable),
+            "the composite action must not export {variable} globally"
+        );
+    }
+    for variable in [
+        "NEOMACS_MELPA_ORACLE_EMACS",
+        "NEOVM_ORACLE_EMACS",
+        "NEOVM_FORCE_ORACLE_PATH",
+        "NEOMACS_GUI_TEST_GNU_EMACS",
+    ] {
+        assert!(action.contains(variable));
+    }
     assert!(action.contains("if: inputs.runtime == 'true'"));
     assert!(action.contains("if: inputs.archive == 'true'"));
+    assert!(action.contains("if: inputs.gnu-reference == 'true'"));
     assert!(action.contains("neomacs-test-runtime-linux-x86_64"));
     assert!(action.contains("neomacs-workspace-tests-nextest-archive-linux-x86_64"));
+}
+
+#[test]
+fn tui_and_gui_gnu_harnesses_attest_resolved_executables() {
+    let tui = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("crates/neomacs-tui-tests/src/lib.rs"),
+    )
+    .expect("TUI harness");
+    let gui = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR"))
+            .join("crates/neomacs-gui-tests/tests/real_gui_smoke.rs"),
+    )
+    .expect("GUI harness");
+    let melpa = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR"))
+            .join("crates/neomacs-melpa-test-support/src/lib.rs"),
+    )
+    .expect("MELPA support");
+    let oracle = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("crates/neovm-oracle-tests/src/common.rs"),
+    )
+    .expect("Neovm oracle support");
+    let coverage = fs::read_to_string(
+        PathBuf::from(env!("CARGO_WORKSPACE_DIR"))
+            .join("crates/neovm-oracle-tests/src/coverage.rs"),
+    )
+    .expect("Neovm coverage support");
+
+    for (name, source) in [("TUI", &tui), ("GUI", &gui)] {
+        assert!(
+            source.contains("neomacs_parity_reference::attest"),
+            "{name} GNU entry point must attest its resolved executable"
+        );
+        assert!(
+            source.contains("AttestationDepth::Fingerprint"),
+            "{name} GNU entry point must use fingerprint attestation"
+        );
+        assert!(
+            source.contains("AttestationError::ExecutableUnresolved"),
+            "{name} must preserve unresolved-reference handling"
+        );
+    }
+    for (name, source) in [
+        ("TUI", tui),
+        ("MELPA", melpa),
+        ("Neovm oracle", oracle),
+        ("Neovm coverage", coverage),
+        ("GUI", gui),
+    ] {
+        assert!(
+            source.contains("uninstalled_gnu_environment"),
+            "{name} GNU launch must apply the extracted-tree environment helper"
+        );
+    }
 }
 
 #[test]

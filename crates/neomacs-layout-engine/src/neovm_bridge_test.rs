@@ -66,6 +66,35 @@ fn window_named_face_inheritance_observes_default_face_remapping() {
     );
 }
 
+#[test]
+fn mode_line_active_keeps_canonical_face_for_unrelated_default_remap() {
+    let _runtime = neovm_core::emacs_core::Context::new();
+    let table = neovm_core::face::FaceTable::new();
+    let resolver = FaceResolver::new(&table, 0x00ff_ffff, 0x0000_0000, 14.0, None);
+    let mut buffer = test_buffer(206, "*mode-line-unrelated-remap*");
+    buffer.set_buffer_local(
+        "face-remapping-alist",
+        Value::list(vec![Value::list(vec![
+            Value::symbol("default"),
+            Value::list(vec![Value::keyword("foreground"), Value::string("#009acd")]),
+            Value::symbol("default"),
+        ])]),
+    );
+
+    let mut next_check = buffer.point_max_char_pos().get();
+    let resolved = resolver.default_base_face_for_origin(
+        Some(&buffer),
+        &DisplayOrigin::ModeLine { selected: true },
+        &mut next_check,
+    );
+    let canonical = resolver.resolve_named_face("mode-line-active");
+
+    assert_eq!(
+        resolved, canonical,
+        "an unrelated default remap must not dynamically realize mode-line-active"
+    );
+}
+
 trait BufferTextPropertyTestExt {
     fn put_text_property(&mut self, start: usize, end: usize, name: Value, value: Value) -> bool;
 }

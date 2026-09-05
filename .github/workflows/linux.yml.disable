@@ -20,13 +20,17 @@ jobs:
       RUST_BACKTRACE: 1
       TMPDIR: ${{ github.workspace }}/tmp
       NEOMACS_TUI_RECORD: on
-      NEOMACS_MELPA_ORACLE_EMACS: /usr/bin/emacs
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Prepare workspace temp directory
         run: mkdir -p "$TMPDIR"
+
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: "true"
 
       - name: Install system dependencies (apt)
         run: scripts/ci/setup-linux.sh ecosystem

@@ -2183,6 +2183,9 @@ fn x_popup_menu_interactive_loop(
                         return Ok(Value::NIL);
                     };
                     *selected = index;
+                    show_popup_menu_selection(
+                        ctx, frame_id, placement, title, entries, *selected, &mut help,
+                    )?;
                     return Ok(event);
                 }
             }

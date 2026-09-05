@@ -1,6 +1,7 @@
 //! Coverage checks for oracle parity tests.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 use std::process::Command;
 
 use crate::common::live_oracle_enabled;
@@ -17,8 +18,11 @@ fn oracle_emacs_path() -> String {
 fn run_oracle_name_dump(program: &str) -> Result<BTreeSet<String>, String> {
     let oracle_bin = oracle_emacs_path();
 
-    let output = Command::new(&oracle_bin)
-        .args(["--batch", "-Q", "--eval", program])
+    let mut command = Command::new(&oracle_bin);
+    command.args(["--batch", "-Q", "--eval", program]).envs(
+        neomacs_parity_reference::uninstalled_gnu_environment(Path::new(&oracle_bin)),
+    );
+    let output = command
         .output()
         .map_err(|e| format!("failed to run oracle Emacs: {e}"))?;
 

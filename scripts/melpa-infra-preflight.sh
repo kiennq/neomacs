@@ -91,6 +91,20 @@ run_probe() {
   local editor_tmp="$scratch_root/$label/tmp"
   local output="$scratch_root/$label/stdout"
   local errors="$scratch_root/$label/stderr"
+  local -a runtime_environment=()
+
+  if [[ $label == gnu-emacs ]]; then
+    local gnu_root
+    gnu_root=$(cd "$(dirname "$executable")/.." && pwd)
+    if [[ -d "$gnu_root/lisp" && -d "$gnu_root/etc" && -d "$gnu_root/lib-src" ]]; then
+      runtime_environment=(
+        "EMACSDATA=$gnu_root/etc"
+        "EMACSDOC=$gnu_root/etc"
+        "EMACSPATH=$gnu_root/lib-src"
+        "EMACSLOADPATH=$gnu_root/lisp"
+      )
+    fi
+  fi
 
   mkdir -p \
     "$home" \
@@ -101,6 +115,7 @@ run_probe() {
     "$scratch_root/$label/xdg/state"
 
   if ! env \
+    "${runtime_environment[@]}" \
     HOME="$home" \
     TMPDIR="$editor_tmp" \
     XDG_CONFIG_HOME="$scratch_root/$label/xdg/config" \

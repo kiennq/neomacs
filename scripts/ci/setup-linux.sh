@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly usage="usage: $0 [--list] {build|build-no-gstreamer|oracle|ecosystem|release}"
+readonly usage="usage: $0 [--list] {build|build-no-gstreamer|oracle|ecosystem|display|release}"
 
 list_only=false
 if [[ ${1:-} == "--list" ]]; then
@@ -55,10 +55,28 @@ readonly -a video_backend_packages=(
     libgstreamer-plugins-base1.0-dev
 )
 
+readonly -a gnu_runtime_packages=(
+    libgtk-3-0t64
+    libjansson4
+    libharfbuzz0b
+    libtree-sitter0
+    libsqlite3-0
+    libgnutls30t64
+    libgdk-pixbuf-2.0-0
+    libgif7
+    libjpeg8
+    libpng16-16t64
+    libtiff6
+    libxpm4
+    libxft2
+    libotf1
+)
+
 declare -a profile_packages=()
 declare -a required_commands=()
 requires_emacs=false
 requires_libfaketime=false
+requires_nerd_font=false
 requires_gstreamer=true
 case "$profile" in
     build)
@@ -67,13 +85,15 @@ case "$profile" in
         requires_gstreamer=false
         ;;
     oracle)
-        profile_packages=(emacs-nox libfaketime)
-        requires_emacs=true
+        profile_packages=("${gnu_runtime_packages[@]}" libfaketime)
+        requires_emacs=false
         requires_libfaketime=true
         ;;
     ecosystem)
         profile_packages=(
-            emacs-nox
+            "${gnu_runtime_packages[@]}"
+            ca-certificates
+            curl
             gnupg
             libfaketime
             xvfb
@@ -86,6 +106,11 @@ case "$profile" in
         required_commands=(gpg Xvfb xauth xdpyinfo xdotool import weston)
         requires_emacs=true
         requires_libfaketime=true
+        requires_nerd_font=true
+        ;;
+    display)
+        profile_packages=(ca-certificates curl)
+        requires_nerd_font=true
         ;;
     release)
         profile_packages=(rpm binutils cpio file dpkg-dev)
@@ -115,6 +140,34 @@ fi
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends "${packages[@]}"
 
+if $requires_nerd_font; then
+    readonly nerd_font_url="https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/JetBrainsMono/Ligatures/Regular/JetBrainsMonoNerdFont-Regular.ttf"
+    readonly nerd_font_sha256="0ec29a68b539ece7078fc714cebff0c0accb2f4948f8f7963d9f5e86633b12d9"
+    readonly nerd_font_tmp="$(mktemp)"
+    readonly nerd_font_dir="/usr/local/share/fonts/neomacs"
+    trap 'rm -f "$nerd_font_tmp"' EXIT
+
+    curl \
+        --fail \
+        --location \
+        --retry 5 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --connect-timeout 20 \
+        --output "$nerd_font_tmp" \
+        "$nerd_font_url"
+    printf '%s  %s\n' "$nerd_font_sha256" "$nerd_font_tmp" | sha256sum --check --status -
+    sudo install -D -m 0644 "$nerd_font_tmp" \
+        "$nerd_font_dir/JetBrainsMonoNerdFont-Regular.ttf"
+    fc-cache -f "$nerd_font_dir"
+
+    if ! fc-match --format='%{family}\n' 'JetBrainsMono Nerd Font:charset=f48a' |
+        grep -Fq 'JetBrainsMono Nerd Font'; then
+        echo "JetBrainsMono Nerd Font U+F48A coverage is unavailable" >&2
+        exit 1
+    fi
+fi
+
 # Fail at the environment seam instead of silently compiling out optional
 # primitives and discovering the mismatch much later in an oracle test.
 pkg-config --modversion lcms2
@@ -123,7 +176,18 @@ if $requires_gstreamer; then
 fi
 
 if $requires_emacs; then
-    emacs --batch --quick --eval '(kill-emacs 0)'
+    if [[ -z ${NEOMACS_MELPA_ORACLE_EMACS:-} ]]; then
+        echo "setup-linux.sh $profile requires NEOMACS_MELPA_ORACLE_EMACS" >&2
+        exit 1
+    fi
+    readonly gnu_emacs="$NEOMACS_MELPA_ORACLE_EMACS"
+    readonly gnu_root="$(cd "$(dirname "$gnu_emacs")/.." && pwd)"
+    env \
+        "EMACSDATA=$gnu_root/etc" \
+        "EMACSDOC=$gnu_root/etc" \
+        "EMACSPATH=$gnu_root/lib-src" \
+        "EMACSLOADPATH=$gnu_root/lisp" \
+        "$gnu_emacs" --batch --quick --eval '(kill-emacs 0)'
 fi
 if $requires_libfaketime; then
     dpkg -L libfaketime | grep -q '/libfaketime\.so\.1$'

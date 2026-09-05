@@ -4074,6 +4074,19 @@ pub(super) fn process_publishes_status_after_ready_output(proc: &Process) -> boo
             && !process_command_is_shell_command(proc))
 }
 
+pub(super) fn process_defers_deferred_status_after_child_output(proc: &Process) -> bool {
+    #[cfg(windows)]
+    {
+        proc.live_io.child.has_child()
+            && process_output_source(proc) == Some(ProcessOutputSource::ChildStdout)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = proc;
+        false
+    }
+}
+
 pub(super) fn process_should_defer_explicit_coding_status_after_output(
     proc: &Process,
     saw_output: bool,
@@ -8904,7 +8917,12 @@ impl super::super::eval::Context {
                     .processes
                     .get(pid)
                     .is_some_and(process_defers_pty_status_after_explicit_coding);
-                if is_deferred_status {
+                let defers_deferred_status_after_child_output = is_deferred_status
+                    && self
+                        .processes
+                        .get(pid)
+                        .is_some_and(process_defers_deferred_status_after_child_output);
+                if defers_deferred_status_after_child_output {
                     // A Windows child handle can become signaled before the
                     // pipe's bytes are visible to PeekNamedPipe.  Do not
                     // retire the process in that gap: drain output first,

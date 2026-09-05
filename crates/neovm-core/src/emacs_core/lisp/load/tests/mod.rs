@@ -3586,6 +3586,40 @@ fn bootstrap_runtime_execute_extended_command_exits_minibuffer_on_ret() {
     );
 }
 
+/// Run a bootstrap command loop as a recursive edit nested under the
+/// top-level command loop.  Direct test calls start at raw depth 0, but
+/// `recursive_edit_inner` itself enters at raw depth 1, which is the
+/// outermost GNU-visible loop and therefore does not catch `exit-recursive-edit`.
+struct BootstrapCommandLoopGuard<'a> {
+    eval: &'a mut Context,
+    outer_depth: usize,
+}
+
+impl<'a> BootstrapCommandLoopGuard<'a> {
+    fn enter(eval: &'a mut Context) -> Self {
+        let outer_depth = eval.command_loop.recursive_depth;
+        eval.command_loop.recursive_depth = outer_depth + 1;
+        Self { eval, outer_depth }
+    }
+
+    fn run(&mut self) -> crate::emacs_core::error::EvalResult {
+        self.eval.recursive_edit_inner()
+    }
+}
+
+impl Drop for BootstrapCommandLoopGuard<'_> {
+    fn drop(&mut self) {
+        self.eval.command_loop.recursive_depth = self.outer_depth;
+    }
+}
+
+fn run_bootstrap_command_loop(eval: &mut Context) -> crate::emacs_core::error::EvalResult {
+    let mut guard = BootstrapCommandLoopGuard::enter(eval);
+    let result = guard.run();
+    drop(guard);
+    result
+}
+
 #[test]
 fn bootstrap_runtime_command_loop_executes_meta_x_command_on_ret() {
     init_test_tracing();
@@ -3628,9 +3662,7 @@ fn bootstrap_runtime_command_loop_executes_meta_x_command_on_ret() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("command loop should exit normally");
+    let result = run_bootstrap_command_loop(&mut eval).expect("command loop should exit normally");
     assert_eq!(result, Value::NIL);
     assert!(
         eval.eval_symbol("neo-ret-probe-ran")
@@ -3909,9 +3941,7 @@ fn bootstrap_runtime_command_loop_meta_s_o_opens_clean_occur_prompt_from_input_r
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("command loop should exit normally");
+    let result = run_bootstrap_command_loop(&mut eval).expect("command loop should exit normally");
     assert_eq!(result, Value::NIL);
     assert_eq!(
         eval_rendered(&mut eval, "neo-occur-keyboard-prompt-log"),
@@ -3974,13 +4004,14 @@ fn bootstrap_runtime_command_loop_meta_x_ret_opens_clean_nested_grep_prompt_from
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("command loop should exit normally");
+    let result = run_bootstrap_command_loop(&mut eval).expect("command loop should exit normally");
     assert_eq!(result, Value::NIL);
+    let color_mode = if cfg!(windows) { "always" } else { "auto" };
     assert_eq!(
         eval_rendered(&mut eval, "neo-grep-keyboard-prompt-log"),
-        r#"OK (#("Run grep (like this): grep --color=auto -nH --null -e " 0 22 (read-only t rear-nonsticky t front-sticky t field t)) "Run grep (like this): grep --color=auto -nH --null -e " 23 nil)"#
+        format!(
+            r#"OK (#("Run grep (like this): grep --color={color_mode} -nH --null -e " 0 22 (read-only t rear-nonsticky t front-sticky t field t)) "Run grep (like this): grep --color={color_mode} -nH --null -e " 23 nil)"#
+        )
     );
 }
 
@@ -4078,8 +4109,7 @@ fn bootstrap_runtime_mx_eager_completion_services_printable_input_before_quit() 
 
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("test exit command should leave the outer command loop normally");
     let observed_before_quit = sender.join().expect("input sender should finish");
 
@@ -4173,8 +4203,7 @@ fn bootstrap_runtime_read_key_after_two_minibuffers_consumes_fresh_key() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("read-key test command loop should exit normally");
     assert_eq!(result, Value::NIL);
     assert_eq!(
@@ -4252,8 +4281,7 @@ fn bootstrap_runtime_minibuffer_read_restores_outer_this_command_keys() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("minibuffer this-command-keys command loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -5080,9 +5108,7 @@ fn bootstrap_runtime_save_some_buffers_space_saves_modified_file() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("command loop should exit normally");
+    let result = run_bootstrap_command_loop(&mut eval).expect("command loop should exit normally");
     assert_eq!(result, Value::NIL);
 
     let saved = fs::read_to_string(&file_path).expect("read probe file after save-some-buffers");
@@ -5153,9 +5179,7 @@ fn bootstrap_runtime_command_loop_sets_last_nonmenu_event_for_keyboard_invocatio
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("command loop should exit normally");
+    let result = run_bootstrap_command_loop(&mut eval).expect("command loop should exit normally");
     assert_eq!(result, Value::NIL);
 
     let observed = eval
@@ -5193,7 +5217,11 @@ fn bootstrap_runtime_command_loop_disabled_command_consumes_space_reply_once() {
              (erase-buffer)
              (insert "ALPHA LINE\nBETA LINE\n")
              (goto-char (point-min))
-             (setq neo-disabled-command-finish nil))"#,
+             (setq neo-disabled-command-finish nil)
+             (defun neo-disabled-command-loop-exit ()
+               (interactive)
+               (exit-recursive-edit))
+             (global-set-key (kbd "C-c q") #'neo-disabled-command-loop-exit))"#,
     )
     .expect("setup disabled-command probe");
 
@@ -5218,14 +5246,21 @@ fn bootstrap_runtime_command_loop_disabled_command_consumes_space_reply_once() {
         crate::keyboard::KeyEvent::char(' '),
     ))
     .expect("queue SPC reply");
+    tx.send(crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char_with_mods('c', crate::keyboard::Modifiers::ctrl()),
+    ))
+    .expect("queue command-loop exit prefix");
+    tx.send(crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('q'),
+    ))
+    .expect("queue command-loop exit key");
     drop(tx);
 
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("disabled-command loop should exit normally");
+    let result =
+        run_bootstrap_command_loop(&mut eval).expect("disabled-command loop should exit normally");
     assert_eq!(result, Value::NIL);
 
     let observed = eval_rendered(
@@ -5374,7 +5409,11 @@ fn bootstrap_runtime_command_loop_universal_argument_prefix_reaches_following_co
         r#"(progn
              (switch-to-buffer "*universal-argument-target*")
              (erase-buffer)
-             (setq neo-universal-argument-finish nil))"#,
+             (setq neo-universal-argument-finish nil)
+             (defun neo-universal-argument-loop-exit ()
+               (interactive)
+               (exit-recursive-edit))
+             (global-set-key (kbd "C-c q") #'neo-universal-argument-loop-exit))"#,
     )
     .expect("setup universal argument probe");
 
@@ -5391,13 +5430,20 @@ fn bootstrap_runtime_command_loop_universal_argument_prefix_reaches_following_co
         crate::keyboard::KeyEvent::char('a'),
     ))
     .expect("queue a");
+    tx.send(crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char_with_mods('c', crate::keyboard::Modifiers::ctrl()),
+    ))
+    .expect("queue command-loop exit prefix");
+    tx.send(crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('q'),
+    ))
+    .expect("queue command-loop exit key");
     drop(tx);
 
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("universal argument loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -5430,7 +5476,11 @@ fn bootstrap_runtime_command_loop_raw_universal_argument_reaches_form_interactiv
              (defun neo-raw-universal-argument-probe (raw after)
                (interactive (list current-prefix-arg prefix-arg))
                (setq neo-raw-universal-argument-seen (list raw after)))
-             (global-set-key (kbd "M-|") #'neo-raw-universal-argument-probe))"#,
+             (global-set-key (kbd "M-|") #'neo-raw-universal-argument-probe)
+             (defun neo-raw-universal-argument-loop-exit ()
+               (interactive)
+               (exit-recursive-edit))
+             (global-set-key (kbd "C-c q") #'neo-raw-universal-argument-loop-exit))"#,
     )
     .expect("setup raw universal argument probe");
 
@@ -5447,13 +5497,20 @@ fn bootstrap_runtime_command_loop_raw_universal_argument_reaches_form_interactiv
         crate::keyboard::KeyEvent::char('|'),
     ))
     .expect("queue |");
+    tx.send(crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char_with_mods('c', crate::keyboard::Modifiers::ctrl()),
+    ))
+    .expect("queue command-loop exit prefix");
+    tx.send(crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('q'),
+    ))
+    .expect("queue command-loop exit key");
     drop(tx);
 
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("raw universal argument loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -5584,9 +5641,8 @@ fn bootstrap_runtime_read_from_minibuffer_binds_requested_history_variable_and_p
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
-        .expect("history probe loop should exit normally");
+    let result =
+        run_bootstrap_command_loop(&mut eval).expect("history probe loop should exit normally");
     assert_eq!(result, Value::NIL);
 
     let observed = eval_rendered(&mut eval, "neo-read-expression-history-probe-result");
@@ -5651,8 +5707,7 @@ fn bootstrap_runtime_completing_read_persists_requested_history_variable() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("completing-read probe loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -5723,8 +5778,7 @@ fn bootstrap_runtime_read_extended_command_recall_uses_extended_command_history(
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("read-extended-command probe loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -5811,8 +5865,7 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_mx_history_with_numeric_positio
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("M-x history command-loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -5874,9 +5927,12 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_calendar_after_quit() {
                   (signal (car err) (cdr err)))))
              (advice-add 'previous-history-element
                          :around #'neo-mx-calendar-history-capture)
+             (setq command-error-function #'command-error-default-function)
              (global-set-key (kbd "M-'") #'neo-mx-calendar-history-stop))"#,
     )
     .expect("setup calendar M-x history probe");
+
+    eval.set_variable("noninteractive", Value::NIL);
 
     let (tx, rx) = crossbeam_channel::unbounded();
     tx.send(crate::keyboard::InputEvent::key_press(
@@ -5922,8 +5978,7 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_calendar_after_quit() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("calendar M-x history command-loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -6199,8 +6254,7 @@ fn bootstrap_runtime_cx_s_space_saves_typed_edit_from_command_loop() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("typed save-some command loop should exit normally");
     assert_eq!(result, Value::NIL);
 
@@ -6339,7 +6393,7 @@ fn bootstrap_runtime_command_loop_logs_help_route_for_ch_b() {
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let _ = eval.recursive_edit_inner();
+    let _ = run_bootstrap_command_loop(&mut eval);
     assert_eq!(
         format_eval_result(&eval.eval_str(
             r#"(prog1 neo-help-b-route-log
@@ -7941,8 +7995,7 @@ fn bootstrap_runtime_command_loop_cx_b_uses_recent_file_buffer_as_second_default
     eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
-    let result = eval
-        .recursive_edit_inner()
+    let result = run_bootstrap_command_loop(&mut eval)
         .expect("switch-buffer command loop should exit normally");
     assert_eq!(result, Value::NIL);
 

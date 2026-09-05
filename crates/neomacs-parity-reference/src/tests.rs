@@ -6,6 +6,7 @@
 //! stop anyone rebuilding.  Synthetic dumps carry a real `struct dump_header`
 //! prefix, so they travel the same code path the real one does.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,55 @@ fn pinned_fingerprint() -> [u8; FINGERPRINT_LEN] {
         *byte = index as u8;
     }
     bytes
+}
+
+#[test]
+fn uninstalled_gnu_environment_detects_a_complete_extracted_layout() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let executable = root.path().join("src/emacs");
+    fs::create_dir_all(executable.parent().expect("src parent")).expect("create src");
+    fs::write(&executable, b"emacs").expect("write executable");
+    for directory in ["lisp", "etc", "lib-src"] {
+        fs::create_dir(root.path().join(directory)).expect("create extracted sibling");
+    }
+
+    assert_eq!(
+        uninstalled_gnu_environment(&executable),
+        vec![
+            (
+                OsString::from("EMACSDATA"),
+                root.path().join("etc").into_os_string()
+            ),
+            (
+                OsString::from("EMACSDOC"),
+                root.path().join("etc").into_os_string()
+            ),
+            (
+                OsString::from("EMACSPATH"),
+                root.path().join("lib-src").into_os_string()
+            ),
+            (
+                OsString::from("EMACSLOADPATH"),
+                root.path().join("lisp").into_os_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn uninstalled_gnu_environment_ignores_incomplete_or_installed_layouts() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let installed = root.path().join("emacs");
+    fs::write(&installed, b"installed emacs").expect("write installed executable");
+    assert!(uninstalled_gnu_environment(&installed).is_empty());
+
+    let extracted = root.path().join("src/emacs");
+    fs::create_dir_all(extracted.parent().expect("src parent")).expect("create src");
+    fs::write(&extracted, b"extracted emacs").expect("write extracted executable");
+    for directory in ["lisp", "etc"] {
+        fs::create_dir(root.path().join(directory)).expect("create extracted sibling");
+    }
+    assert!(uninstalled_gnu_environment(&extracted).is_empty());
 }
 
 // ---------------------------------------------------------------------------

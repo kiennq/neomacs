@@ -19,3 +19,4 @@ libc = { workspace = true }
 tempfile.workspace = true
 neomacs-display-protocol.workspace = true
 serde_json.workspace = true
+neomacs-parity-reference.workspace = true

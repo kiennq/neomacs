@@ -125,10 +125,12 @@ fn div_f9_global_ring_and_mode_string() {
 #[test]
 fn div_f9_standard_alists_and_hooks() {
     return_if_neovm_enable_oracle_proptest_not_set!();
+    // Compare GNU-owned defaults while excluding Neomacs' deliberate video-mode extension.
     let expect = expect_test::expect![[r#""OK (268 41 nil 8 nil)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
-(list (length auto-mode-alist)
+(list (- (length auto-mode-alist)
+         (if (rassq 'neomacs-video-mode auto-mode-alist) 1 0))
       (length interpreter-mode-alist)
       (assq "\\.el\\'" auto-mode-alist)
       (length minor-mode-map-alist)

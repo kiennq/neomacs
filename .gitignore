@@ -433,6 +433,9 @@ lisp/org/org-loaddefs.el
 crates/neovm-oracle-tests/proptest-regressions/
 /PFiles64/
 /VC/
+/gnu-reference/
+/gnu-emacs-*.tar.zst
+/gnu-emacs-*.tar.zst.sha256
 /gstreamer-*.msi
 /gstreamer/
 /gstreamer-msi-cache/

@@ -2358,6 +2358,46 @@ fn deferred_stderr_notification_still_notifies_pending_owner_first() {
     );
 }
 
+#[test]
+fn deferred_terminal_status_without_child_is_published_in_service_pass() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    let id = eval.processes.create_process_with_kind(
+        "deferred-terminal".into(),
+        Value::NIL,
+        String::new(),
+        vec![],
+        ProcessKindWithoutDevice::Pipe,
+        ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    let (reader, _writer) = os_pipe::pipe().expect("deferred terminal pipe");
+    {
+        let process = eval.processes.get_mut(id).expect("deferred process");
+        process.live_io.child_stdout = Some(ChildOutputReader::Shared(reader));
+        process.status = process_status_run_value();
+        process.pending_status = process_status_exit_value(0);
+        process.status_notify_pending = true;
+    }
+    eval.processes.defer_status_notifications(vec![id]);
+
+    let request = ProcessOutputServiceRequest::target_only(id);
+    eval.poll_process_output_for_service_request(&request)
+        .expect("deferred status service pass");
+
+    assert!(
+        eval.processes.get(id).is_none(),
+        "terminal deferred notification must retire the process"
+    );
+    let process = eval
+        .processes
+        .get_any(id)
+        .expect("retired process keeps its Lisp-visible state");
+    assert_eq!(process.status, process_status_exit_value(0));
+    assert_eq!(process.pending_status, Value::NIL);
+    assert!(!process.status_notify_pending);
+    assert!(process.live_io.child_stdout.is_none());
+}
+
 #[cfg(windows)]
 #[test]
 fn module_pipe_service_polling_is_nonblocking_before_write_and_services_data() {
@@ -4737,30 +4777,38 @@ fn serial_configuration_validates_option_domains() {
 #[test]
 fn serial_process_configure_resolves_buffer_and_port_designators() {
     crate::test_utils::init_test_tracing();
-    let pty = SerialTestPty::open();
-    let port = &pty.slave_path;
-    let result = eval_one(&format!(
+    // `/dev/ptmx` allocates a fresh PTY pair for every serial process.  GNU's
+    // serial_open applies best-effort TIOCEXCL, so sharing one slave path
+    // would make the second constructor fail with EBUSY and would test
+    // exclusivity rather than designator resolution.
+    //
+    // Linux PTYs reject a later CS7-without-parity transition with EINVAL,
+    // although the same CS7 setting is accepted when parity is applied in
+    // the same termios update.  Keep the fixture's bytesize assertion while
+    // making that update valid on the PTY device.
+    let result = eval_one(
         r#"(let ((by-port (make-serial-process
-                           :port "{port}"
-                           :speed 9600))
+                          :port "/dev/ptmx"
+                          :speed 9600))
                  (by-buffer (make-serial-process
-                             :port "{port}"
+                             :port "/dev/ptmx"
                              :name "neo-serial-by-buffer-process"
                              :buffer "neo-serial-by-buffer"
                              :speed 9600)))
              (unwind-protect
                  (progn
                    (serial-process-configure
-                    :port "{port}"
-                    :bytesize 7)
+                    :port "/dev/ptmx"
+                    :bytesize 7
+                    :parity 'even)
                    (serial-process-configure
                     :buffer "neo-serial-by-buffer"
                     :parity 'even)
                    (list (process-contact by-port :bytesize)
                          (process-contact by-buffer :parity)))
                (ignore-errors (delete-process by-port))
-               (ignore-errors (delete-process by-buffer))))"#
-    ));
+               (ignore-errors (delete-process by-buffer))))"#,
+    );
     assert_eq!(result, "OK (7 even)");
 }
 

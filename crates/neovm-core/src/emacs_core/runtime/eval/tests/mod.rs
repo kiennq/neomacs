@@ -13995,7 +13995,7 @@ fn with_selected_window_restores_after_while_no_input_keyboard_interrupt() {
 
     assert_eq!(
         crate::emacs_core::error::format_eval_result(&result),
-        "OK (t t t nil)"
+        "OK (t t t 14)"
     );
 }
 
@@ -14044,7 +14044,7 @@ fn while_no_input_unwinds_inner_with_selected_window_on_keyboard_input() {
 
     assert_eq!(
         crate::emacs_core::error::format_eval_result(&result),
-        "OK (t t t nil)"
+        "OK (t t t 14)"
     );
 }
 
@@ -14154,7 +14154,7 @@ fn safe_run_hook_preserves_selected_window_after_while_no_input_interrupt() {
 
     assert_eq!(
         crate::emacs_core::error::format_eval_result(&result),
-        "OK (t t t nil)"
+        "OK (t t t 14)"
     );
 }
 

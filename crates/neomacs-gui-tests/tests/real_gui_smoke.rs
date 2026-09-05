@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use neomacs_gui_tests::{
@@ -542,6 +542,16 @@ fn gnu_image_oracle_command(
         ),
         ("GDK_BACKEND".to_string(), "x11".to_string()),
     ];
+    env.extend(
+        neomacs_parity_reference::uninstalled_gnu_environment(program)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            }),
+    );
     env.extend(display_env.iter().cloned());
     CommandSpec {
         program: program.to_path_buf(),
@@ -577,9 +587,29 @@ fn neomacs_binary(workspace_root: &std::path::Path) -> PathBuf {
 }
 
 fn gnu_emacs_binary() -> PathBuf {
-    std::env::var_os("NEOMACS_GUI_TEST_GNU_EMACS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/exec/.local/bin/emacs"))
+    let requested = [
+        "NEOMACS_GUI_TEST_GNU_EMACS",
+        "NEOVM_FORCE_ORACLE_PATH",
+        "NEOMACS_MELPA_ORACLE_EMACS",
+        "NEOVM_ORACLE_EMACS",
+        "ORACLE_EMACS",
+    ]
+    .into_iter()
+    .find_map(std::env::var_os)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from("/home/exec/.local/bin/emacs"));
+
+    match neomacs_parity_reference::attest(
+        Path::new(&requested),
+        neomacs_parity_reference::AttestationDepth::Fingerprint,
+    ) {
+        Ok(reference) => reference.executable().to_path_buf(),
+        Err(neomacs_parity_reference::AttestationError::ExecutableUnresolved { .. }) => requested,
+        Err(error) => panic!(
+            "the GNU GUI oracle is present but is NOT the pinned reference; \
+             refusing to compare against it\n{error}"
+        ),
+    }
 }
 
 fn gnu_font_oracle_command(
@@ -602,6 +632,16 @@ fn gnu_font_oracle_command(
             case_filter.to_string(),
         ));
     }
+    env.extend(
+        neomacs_parity_reference::uninstalled_gnu_environment(program)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            }),
+    );
     env.extend(display_env.iter().cloned());
     CommandSpec {
         program: program.to_path_buf(),

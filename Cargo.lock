@@ -3860,6 +3860,7 @@ version = "0.0.16"
 dependencies = [
  "getrandom 0.4.3",
  "image",
+ "neomacs-parity-reference",
  "neovm-core",
  "serde_json",
  "tempfile",
@@ -4003,6 +4004,7 @@ version = "0.0.16"
 dependencies = [
  "libc",
  "neomacs-display-protocol",
+ "neomacs-parity-reference",
  "pty-process",
  "serde_json",
  "tempfile",

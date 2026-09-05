@@ -50,7 +50,6 @@ jobs:
       # comparison only asserts that the two engines agree right now.
       NEOVM_ORACLE_MODE: live
       NEOVM_WINDOW_PROP_CASES: ${{ github.event.inputs.cases || '1200' }}
-      NEOVM_FORCE_ORACLE_PATH: /usr/bin/emacs
       TMPDIR: ${{ github.workspace }}/tmp
 
     steps:
@@ -60,6 +59,11 @@ jobs:
       - name: Prepare workspace temp directory
         run: mkdir -p "$TMPDIR/nextest"
 
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: "true"
+
       - name: Install Linux system dependencies
         run: scripts/ci/setup-linux.sh oracle
 
@@ -68,7 +72,7 @@ jobs:
           # Record the oracle build: a divergence reported here is only
           # meaningful against a known GNU version, and window geometry in
           # particular varies between builds.
-          /usr/bin/emacs --version | head -n 1
+          "$NEOVM_FORCE_ORACLE_PATH" --version | head -n 1
 
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust

@@ -4162,7 +4162,7 @@ U") (list keys up)))))"#
 fn vm_call_interactively_handles_prompt_driven_batch_specs_on_shared_runtime() {
     crate::test_utils::init_test_tracing();
     assert_eq!(
-        vm_eval_str(
+        vm_bootstrap_eval_str(
             r#"(list
                  (let ((unread-command-events (list 97)))
                    (call-interactively '(lambda (x) (interactive "cChar: ") x)))

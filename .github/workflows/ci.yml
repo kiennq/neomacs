@@ -459,6 +459,8 @@ jobs:
       - name: Archive workspace tests
         env:
           CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         run: >-
           cargo nextest archive
           --release
@@ -550,6 +552,11 @@ jobs:
       - *checkout
       - *prepare_workspace_tmp
 
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: ${{ matrix.suite == 'tui' && 'true' || 'false' }}
+
       - name: Install suite dependencies
         run: scripts/ci/setup-linux.sh "${{ matrix.linux_profile }}"
 
@@ -608,13 +615,15 @@ jobs:
       NEXTEST_FILTER: ${{ matrix.filter }}
       NEOMACS_BIN: ${{ github.workspace }}/target/release/neomacs
       NEOMACS_RUNTIME_ROOT: ${{ github.workspace }}
-      NEOMACS_MELPA_ORACLE_EMACS: /usr/bin/emacs
       NEOMACS_GUI_TEST_BACKEND: x11
       NEOMACS_GUI_TEST_BINARY: ${{ github.workspace }}/target/release/neomacs
-      NEOMACS_GUI_TEST_GNU_EMACS: /usr/bin/emacs
     steps:
       - *checkout
       - *prepare_workspace_tmp
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: "true"
       - name: Install Linux ecosystem dependencies
         run: scripts/ci/setup-linux.sh ecosystem
       - name: Set up Rust tooling
@@ -670,7 +679,9 @@ jobs:
     steps:
       - *checkout
       - *prepare_workspace_tmp
-      - *install_linux_deps
+      - name: Install Linux display dependencies
+        if: runner.os == 'Linux'
+        run: scripts/ci/setup-linux.sh display
       - name: Set up Rust tooling
         uses: ./.github/actions/setup-rust
         with:
@@ -711,6 +722,10 @@ jobs:
     steps:
       - *checkout
       - *prepare_workspace_tmp
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: "true"
       - name: Install GNU Emacs oracle dependencies
         run: scripts/ci/setup-linux.sh oracle
       - name: Set up test runner
@@ -757,10 +772,13 @@ jobs:
       NEOMACS_GUI_TEST_BACKEND: x11
       NEOMACS_GUI_TEST_BINARY: ${{ github.workspace }}/target/release/neomacs
       NEOMACS_GUI_TEST_CLIENT_BINARY: ${{ github.workspace }}/target/release/neomacsclient
-      NEOMACS_GUI_TEST_GNU_EMACS: /usr/bin/emacs
     steps:
       - *checkout
       - *prepare_workspace_tmp
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: "true"
       - name: Install Linux ecosystem dependencies
         run: scripts/ci/setup-linux.sh ecosystem
       - name: Set up Rust tooling
@@ -811,10 +829,13 @@ jobs:
       TMPDIR: ${{ github.workspace }}/tmp
       NEOMACS_BIN: ${{ github.workspace }}/target/release/neomacs
       NEOMACS_RUNTIME_ROOT: ${{ github.workspace }}
-      NEOMACS_MELPA_ORACLE_EMACS: /usr/bin/emacs
     steps:
       - *checkout
       - *prepare_workspace_tmp
+      - name: Download GNU reference
+        uses: ./.github/actions/download-test-assets
+        with:
+          gnu-reference: "true"
       - name: Install Linux ecosystem dependencies
         run: scripts/ci/setup-linux.sh ecosystem
       - name: Set up Rust tooling

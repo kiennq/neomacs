@@ -30,7 +30,8 @@
 # RE-BASELINING.  A rebuild of the GNU mirror is its own change with its own
 # re-baselining, never a side effect of a session.  To re-pin, run
 #
-#     cargo run -p xtask -- pin-reference --emacs PATH --reason "..."
+#     cargo run -p xtask -- pin-reference --emacs PATH --reason "..." \
+#         --mirror-commit 0ee48ac4df205e0d915946b5db00e73a0cd21ae0
 #
 # which rewrites the keys below and appends to the log in this comment block.
 # Editing the keys by hand defeats the log; the command exists so that the

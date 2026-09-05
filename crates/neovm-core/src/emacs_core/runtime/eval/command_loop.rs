@@ -1421,6 +1421,7 @@ impl Context {
             ModeLineUpdateTarget::AllBuffers => true,
         };
         if !has_mode_line_to_update {
+            self.invalidate_redisplay();
             return;
         }
 
@@ -2504,7 +2505,11 @@ impl Context {
             && !self
                 .quit_requested
                 .load(std::sync::atomic::Ordering::Relaxed)
-            && (self.throw_on_input.is_nil() || !self.has_throw_on_input_poll_source())
+            && (self
+                .obarray
+                .symbol_value_id_or_nil(self.throw_on_input_symbol)
+                .is_nil()
+                || !self.has_throw_on_input_poll_source())
     }
 
     #[inline(always)]
@@ -2526,7 +2531,11 @@ impl Context {
             && !self
                 .quit_requested
                 .load(std::sync::atomic::Ordering::Relaxed)
-            && (self.throw_on_input.is_nil() || !self.has_throw_on_input_poll_source())
+            && (self
+                .obarray
+                .symbol_value_id_or_nil(self.throw_on_input_symbol)
+                .is_nil()
+                || !self.has_throw_on_input_poll_source())
         {
             return Ok(());
         }
